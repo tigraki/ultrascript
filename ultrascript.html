@@ -1,0 +1,3874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Ultrascript</title>
+<style>
+:root {
+  --bar-h:     2.75rem; /* live bar height — updated by JS; CSS uses var(--bar-h) so #scroll and overlays track it automatically */
+  /* Reading-line anchor as a unitless number (0.33 = 33% — the broadcast
+     standard used by Autocue/QTV-equipped newsrooms; some setups prefer
+     0.38 "eye-rest"). Single source of truth for prose padding-top, the
+     cue overlay positions, the cue-fade gradient stop, and the JS skip /
+     manual-resume math. JS `setReadingAnchor()` updates this variable
+     and mirrors it into the JS `READING_ANCHOR` constant. */
+  --reading-anchor: 0.33;
+  --bg:        #111;
+  --text:      #f0ede6;
+  --text2:     #3a3a3a;
+  --bar:       #161616;
+  --bar-bd:    rgba(255,255,255,0.08);
+  --bar-text:  #f0f0f0;
+  --bar-dim:   #666;
+  --seg-bg:    #1e1e1e;
+  --seg-bd:    #333;
+  --seg-off:   #555;
+  --seg-on:    #f0f0f0;
+  --seg-on-bg: #2e2e2e;
+  --acc:       #aaa;
+  --go-bg:     #efefef;
+  --go-fg:     #111;
+  --overlay:   rgba(0,0,0,0.6);
+  --panel:     #181818;
+  --panel-bd:  rgba(255,255,255,0.08);
+  /* Explicit z-index scale. Layers from bottom to top: cue overlays sit
+     just above the prose so the reading line draws over text; wordmark
+     above that; countdown sits above the reading area; settings panel
+     covers the canvas; snapshot recovery banner sits above the panel
+     because it surfaces on load before the user opens settings; error
+     toast outranks everything because it signals a broken-state event.
+     Anywhere a hardcoded z-index is needed (e.g. inline-styled banners
+     created in JS), reach for these variables instead. */
+  --z-cue:        5;
+  --z-wordmark:   4;
+  --z-countdown: 50;
+  --z-settings: 100;
+  --z-banner:   200;
+  --z-toast:    300;
+  --z-error:   9999;
+}
+html[data-theme="light"] {
+  --bg:        #f5f2eb;
+  --text:      #1a1814;
+  --text2:     #ccc;
+  --bar:       rgba(232,229,221,0.98);
+  --bar-bd:    rgba(0,0,0,0.08);
+  --bar-text:  #111;
+  --bar-dim:   #888;
+  --seg-bg:    #e4e1da;
+  --seg-bd:    #ccc9c0;
+  --seg-off:   #999;
+  --seg-on:    #111;
+  --seg-on-bg: #fff;
+  --acc:       #444;
+  --go-bg:     #1a1a1a;
+  --go-fg:     #f5f2eb;
+  --overlay:   rgba(0,0,0,0.35);
+  --panel:     #eeeae0;
+  --panel-bd:  rgba(0,0,0,0.08);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; -webkit-text-size-adjust: none; }
+
+#scroll {
+  position: fixed; inset: 0; bottom: var(--bar-h);
+  overflow: hidden; transition: bottom .4s ease;
+  /* touch-action: none means the browser doesn't try to do its default
+     gesture work on this element. Our touchmove handler already
+     preventDefaults, but on iOS the browser's gesture detector still
+     runs in parallel and can introduce a brief inertia hand-off when
+     the user releases — visible as the prompter "kicking" forward by a
+     few pixels after a precise reposition. Setting touch-action: none
+     stops the gesture work at intent-detection time, eliminating the
+     kick. The contenteditable child (#prose) keeps the default
+     touch-action so single-tap focus / caret placement still works. */
+  touch-action: none;
+}
+#prose { touch-action: auto; }
+
+#prose {
+  /* Top padding places the first line at the reading-line anchor (defaults
+     to 33vh — broadcast standard). svh = "small viewport height" excludes
+     iOS Safari's address bar, so the first line lands at the visible
+     reading anchor on first paint instead of overshooting below it. The
+     calc fallback uses 100vh on browsers that don't support svh (Safari
+     <15.4, older Android WebView). Bottom padding is just trailing
+     whitespace so the last line scrolls comfortably above the bar. */
+  padding: calc(var(--reading-anchor) * 100vh) 2.5rem 55vh;
+  padding-top: calc(var(--reading-anchor) * 100svh);
+  padding-bottom: 55svh;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.75rem;
+  line-height: 3.0;
+  color: var(--text);
+  letter-spacing: .015em;
+  max-width: 36rem;
+  margin: 0 auto;
+  outline: none;
+  /* Standard `overflow-wrap: break-word` (was the deprecated WebKit alias
+     `word-break: break-word`). The deprecated alias has a documented
+     interaction with `letter-spacing` on iOS Safari and some Android
+     engines where the browser swallows the space character at a
+     line-wrap point — visually merging the two adjacent words. The
+     standard property only breaks unbreakable long strings (URLs,
+     hash-strings) when they'd otherwise overflow horizontally, and
+     never consumes whitespace at the break. Word spacing now survives
+     desktop → mobile reflow. */
+  overflow-wrap: break-word;
+  word-break: normal;
+  min-height: 100%;
+}
+#prose:empty::before {
+  content: "Paste or type your script here…";
+  color: var(--text2);
+  pointer-events: none;
+}
+/* Compact speaker spacing: collapse blank-line divs (<div><br></div>) so
+   empty lines between speaker turns don't render as full line-height gaps.
+   Applied by JS via the .compact-speakers class when the toggle is on.
+   :has() is supported in Chrome 105+, Firefox 121+, Safari 15.4+. */
+#prose.compact-speakers > div:has(> br:only-child) { display: none; }
+
+#bar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: auto;
+  min-height: 2.75rem;
+  background: var(--bar);
+  border-top: 1px solid var(--bar-bd);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0 .75rem;
+  gap: .5rem;
+  /* No overflow scroll — the lean v1.1 control set fits on every viewport
+     we target without needing a scrollable bar, and the wrap behaviour
+     handles the rare narrow case more gracefully than a hidden scroller. */
+  overflow: visible;
+  /* auto-hide */
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity .4s ease, transform .4s ease;
+  will-change: opacity, transform;
+}
+#bar.hidden {
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+}
+#bar::-webkit-scrollbar { display: none; }
+
+#btn-go { flex-shrink:0; font-size:.8125rem; font-weight:700; font-family:inherit; background:var(--go-bg); color:var(--go-fg); border:none; border-radius:.375rem; padding:.25rem 1rem; cursor:pointer; letter-spacing:.04em; min-width:5rem; text-align:center; }
+#btn-go:hover { opacity:.8; }
+
+/* Countdown toggle now lives in Settings → Preferences (no longer on the bar).
+   Inherits .btn-pill base styling; the on-state lifts the border to the
+   accent color so the user can tell at a glance whether countdown is
+   armed. */
+#btn-cd.on { border-color:var(--acc); color:var(--bar-text); }
+
+.div { width:1px; height:1.375rem; background:var(--bar-bd); flex-shrink:0; }
+/* Pushes the right-side cluster (timer + START + Multi + Settings) all the
+   way to the right edge of the bar — the WPM group sits flush left, the
+   spacer eats the remaining width, and everything after it lines up tight
+   on the right. flex-shrink:0 so the spacer never collapses on narrow
+   viewports (the bar wraps before the cluster compresses). */
+.bar-spacer { margin-left: auto; flex-shrink: 0; }
+.grp { display:flex; align-items:center; gap:.375rem; flex-shrink:0; }
+.lbl { font-size:.5625rem; font-weight:600; color:var(--bar-dim); text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+.val { font-size:.6875rem; font-weight:600; color:var(--bar-text); min-width:2rem; text-align:right; cursor:pointer; }
+.val:hover { color:var(--acc); }
+input[type=range] { accent-color:var(--acc); cursor:pointer; }
+#spd-sl { width:7rem; }
+#fnt-sl  { width:3.75rem; }
+#lh-sl   { width:3.25rem; }
+
+/* Hidden at rest (display:none in the markup); doStart() flips display
+   back to '' and doPause() hides it again. The bar's flex-wrap layout
+   handles the layout shift naturally — the timer slides into place to
+   the left of START when playback begins. */
+#tmr { font-size:.6875rem; font-weight:600; color:var(--bar-text); font-variant-numeric:tabular-nums; flex-shrink:0; }
+
+.seg { display:flex; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.3125rem; padding:.125rem; gap:.125rem; flex-shrink:0; }
+.seg button { font-size:.5625rem; font-weight:600; font-family:inherit; background:none; border:none; border-radius:.1875rem; padding:.1875rem .4375rem; color:var(--seg-off); cursor:pointer; letter-spacing:.03em; text-transform:uppercase; }
+.seg button.on { background:var(--seg-on-bg); color:var(--seg-on); }
+
+#btn-info { flex-shrink:0; font-size:.625rem; font-weight:600; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.25rem .5rem; color:var(--bar-text); cursor:pointer; }
+#btn-info:hover { opacity:.8; }
+
+.val-input { width:3rem; font-size:.6875rem; font-weight:600; font-family:inherit; background:var(--seg-bg); border:1px solid var(--acc); border-radius:.25rem; padding:.0625rem .25rem; color:var(--bar-text); text-align:right; }
+.val-input:focus { outline:none; }
+
+/* ── COUNTDOWN ── */
+#cd-overlay { display:none; position:fixed; inset:0; bottom:var(--bar-h); z-index:var(--z-countdown); align-items:center; justify-content:center; pointer-events:none; background:rgba(0,0,0,0.18); }
+
+/* ── CUE INDICATOR ── */
+/* Overlay mirrors #scroll's positioning so the reading-line anchor is
+   taken from the scroll area, not the viewport. Both use
+   `bottom: var(--bar-h)`, so they track the bar height automatically
+   when JS updates the CSS variable (no direct style writes needed).
+   All anchor positions read from `--reading-anchor` (a unitless number,
+   default 0.33) so changing the broadcast vs eye-rest setting only
+   touches that one var. */
+#cue-overlay { position:fixed; top:0; left:0; right:0; bottom:var(--bar-h); pointer-events:none; z-index:var(--z-cue); transition:bottom .4s ease; display:none; }
+.cue-ind { display:none; position:absolute; pointer-events:none; }
+#cue-line { left:0; right:0; top:calc(var(--reading-anchor) * 100%); height:1px; background:var(--cue-color); }
+#cue-band { left:0; right:0; background:var(--cue-color); /* top + height set by JS using --reading-anchor */ }
+/* cue-col mirrors #prose's centered column so the left mark sits in
+   the prose's left padding regardless of viewport width. JS updates
+   `max-width` to follow the font-size-scaled prose width. */
+#cue-col { position:absolute; top:0; bottom:0; left:50%; transform:translateX(-50%); width:100%; max-width:36rem; padding:0 2.5rem; box-sizing:border-box; pointer-events:none; }
+#cue-left { left:1.25rem; width:.1875rem; background:var(--cue-color); /* top + height set by JS using --reading-anchor */ }
+/* Fade style: mask on the scroll container fades content above the
+   reading line. Mask is anchored to #scroll's box (fixed positioning),
+   so it doesn't move with content. */
+#scroll.cue-fade { -webkit-mask-image:linear-gradient(to bottom, transparent 0%, black calc(var(--reading-anchor) * 100%)); mask-image:linear-gradient(to bottom, transparent 0%, black calc(var(--reading-anchor) * 100%)); }
+
+/* Named cue-color preset swatches: dark neutral background with a
+   translucent stripe so the preset reads truthfully across themes. */
+.cue-pre { position:relative; background:#1a1a1a; overflow:hidden; color:#888; }
+.cue-pre .cue-pre-fill { position:absolute; left:15%; right:15%; top:50%; height:.1875rem; margin-top:-.09375rem; background:var(--cue-pre-color); border-radius:.0625rem; }
+.cue-pre .cue-pre-lbl { position:absolute; left:0; right:0; bottom:.1875rem; text-align:center; font-size:.4375rem; font-weight:700; letter-spacing:.04em; text-transform:uppercase; color:#888; }
+
+/* ── INFO PANEL ── */
+#info-overlay { display:none; position:fixed; inset:0; z-index:var(--z-settings); background:var(--overlay); align-items:center; justify-content:center; }
+#info-overlay.open { display:flex; }
+
+#info-panel { background:var(--panel); border:1px solid var(--panel-bd); border-radius:.75rem; width:min(36rem,92vw); max-height:min(88vh,50rem); display:flex; flex-direction:column; overflow:hidden; }
+
+/* Panel header: logo + version on the left, close button on the right.
+   The logo is an inherit-color link to ultrascript.vercel.app; the version
+   label sits inline next to it (populated by load() — same source of truth
+   as before, just hoisted from the footer). */
+#info-head { display:flex; align-items:center; justify-content:space-between; padding:.75rem 1.25rem; border-bottom:1px solid var(--panel-bd); flex-shrink:0; }
+#info-logo { font-size:.8125rem; font-weight:600; display:flex; align-items:center; gap:.375rem; }
+#info-logo a { color:inherit; text-decoration:none; }
+#info-logo a:hover { color:var(--acc); }
+#version-label { font-weight:400; color:var(--bar-dim); font-size:.75rem; }
+#btn-close-info { font-size:.875rem; background:none; border:none; color:var(--bar-dim); cursor:pointer; padding:.25rem .375rem; font-family:inherit; line-height:1; border-radius:.25rem; }
+#btn-close-info:hover { color:var(--bar-text); }
+
+/* tabs */
+#info-tabs { display:flex; gap:0; border-bottom:1px solid var(--panel-bd); flex-shrink:0; padding:0 1.25rem; }
+.itab { font-size:.6875rem; font-weight:600; font-family:inherit; background:none; border:none; border-bottom:2px solid transparent; color:var(--bar-dim); cursor:pointer; padding:.5rem .75rem .4375rem; letter-spacing:.03em; text-transform:uppercase; margin-bottom:-1px; }
+.itab.on { color:var(--bar-text); border-bottom-color:var(--acc); }
+
+#info-body { overflow-y:auto; padding:1rem 1.25rem 1.25rem; display:flex; flex-direction:column; gap:1.125rem; }
+#info-body::-webkit-scrollbar { width:.25rem; }
+#info-body::-webkit-scrollbar-thumb { background:var(--seg-bd); border-radius:.25rem; }
+
+.tab-content { display:none; flex-direction:column; gap:1.125rem; }
+.tab-content.on { display:flex; }
+
+/* Section header. Kept slightly accent-coloured (--acc) rather than dim so
+   it scans as a divider but doesn't fade out — the rest of the panel runs
+   at full text colour for legibility. */
+.isec h3 { font-size:.5625rem; font-weight:700; color:var(--acc); letter-spacing:.08em; text-transform:uppercase; margin-bottom:.5rem; }
+.irows { display:flex; flex-direction:column; gap:.375rem; }
+.irow { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; }
+.irow .k { font-size:.8125rem; color:var(--bar-text); white-space:nowrap; flex-shrink:0; }
+/* Description column: full text colour. Was --bar-dim (gray) which dropped
+   below comfortable reading contrast against the dark panel background. */
+.irow .d { font-size:.8125rem; color:var(--bar-text); text-align:right; line-height:1.4; }
+kbd { display:inline-block; font-size:.625rem; font-family:inherit; font-weight:600; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.25rem; padding:.125rem .375rem; color:var(--bar-text); }
+.isep { height:1px; background:var(--panel-bd); flex-shrink:0; }
+
+/* science tab prose — full text colour for body, --acc for section heads. */
+.sci-body { font-size:.8125rem; color:var(--bar-text); line-height:1.7; display:flex; flex-direction:column; gap:.875rem; }
+.sci-body h4 { font-size:.6875rem; font-weight:700; color:var(--acc); letter-spacing:.06em; text-transform:uppercase; margin-bottom:.25rem; }
+.sci-body p { font-size:.8125rem; color:var(--bar-text); line-height:1.7; }
+
+.font-picks { display:flex; gap:.375rem; flex-wrap:wrap; }
+.fpick { font-size:.75rem; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.3125rem .625rem; color:var(--bar-text); cursor:pointer; }
+.fpick.on { border-color:var(--acc); color:var(--bar-text); background:var(--seg-on-bg); }
+.fpick:hover { opacity:.85; }
+
+/* Profile picker — same shape as font picks but a touch larger and
+   labelled, since the buttons load full multi-setting setups. */
+.profile-picks { display:flex; gap:.375rem; flex-wrap:wrap; }
+.ppick { font-size:.75rem; font-weight:600; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.375rem .75rem; color:var(--bar-text); cursor:pointer; letter-spacing:.01em; }
+.ppick.on { border-color:var(--acc); color:var(--bar-text); background:var(--seg-on-bg); }
+.ppick:hover { opacity:.85; }
+.ppick-custom { font-style:italic; opacity:.85; }
+.ppick-custom.on { font-style:normal; opacity:1; }
+
+/* Short blurb under section headers — full text color so it actually
+   reads (no dim gray). Hierarchy comes from font-size + h3 above. */
+.iblurb { font-size:.75rem; color:var(--bar-text); line-height:1.55; margin-bottom:.625rem; }
+
+.cpresets { display:flex; gap:.5rem; flex-wrap:wrap; }
+.cpre { width:2.5rem; height:2.5rem; border-radius:.375rem; border:2px solid transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:.5rem; font-weight:700; flex-shrink:0; }
+.cpre:hover { opacity:.8; }
+.cpre.on { border-color:var(--acc); }
+
+.ccustom { display:flex; flex-direction:column; gap:.5rem; margin-top:.625rem; }
+.crow { display:flex; align-items:center; gap:.5rem; }
+.csw { width:1.75rem; height:1.75rem; border-radius:.3125rem; border:1px solid var(--seg-bd); flex-shrink:0; }
+.clbl { font-size:.6875rem; color:var(--bar-dim); min-width:2rem; flex-shrink:0; }
+.ctabs { display:flex; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.3125rem; padding:.125rem; gap:.125rem; flex-shrink:0; }
+.ctabs button { font-size:.5625rem; font-weight:600; font-family:inherit; background:none; border:none; border-radius:.1875rem; padding:.125rem .3125rem; color:var(--seg-off); cursor:pointer; }
+.ctabs button.on { background:var(--seg-on-bg); color:var(--seg-on); }
+.cinput { flex:1; font-size:.75rem; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.3125rem; padding:.25rem .5rem; color:var(--bar-text); }
+.cinput:focus { outline:none; border-color:var(--acc); }
+
+/* Secondary text button — used for the "Reset to defaults" action inside
+   the Preferences section. Smaller and quieter than the .ppick / .fpick
+   pills since it's a less common action. Hover lifts to the accent color
+   so it still feels interactive. */
+/* Destructive action button — used for Reset to defaults. Red border + text
+   so it reads as "this does something irreversible" without being alarming. */
+#btn-reset { font-size:.75rem; font-weight:600; font-family:inherit; background:none; border:1px solid #c0392b; border-radius:.375rem; padding:.25rem .75rem; color:#c0392b; cursor:pointer; letter-spacing:.01em; }
+#btn-reset:hover { background:rgba(192,57,43,0.10); color:#e05555; border-color:#e05555; }
+
+/* Inline action buttons inside settings sections. Same pill shape as
+   .fpick / .ppick but slightly tighter — used for Load file,
+   Download script, Re-parse, etc. Centralised so future buttons
+   stay visually consistent. */
+.btn-pill { font-size:.6875rem; font-weight:600; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.25rem .625rem; color:var(--bar-text); cursor:pointer; white-space:nowrap; }
+.btn-pill:hover { opacity:.85; }
+/* Snapshot recovery banner. Built dynamically by JS but styled here so
+   CSS variables resolve reliably across all browsers (some older Safari
+   versions resolve var() lazily inside style.cssText). */
+#snap-banner {
+  position:fixed; left:50%; top:1rem; transform:translateX(-50%);
+  background:var(--seg-bg); color:var(--bar-text);
+  border:1px solid var(--acc); border-radius:.375rem;
+  padding:.625rem .875rem; font-size:.75rem;
+  z-index:var(--z-banner);
+  box-shadow:0 4px 14px rgba(0,0,0,0.4);
+  display:flex; align-items:center; gap:.625rem;
+  flex-wrap:wrap; justify-content:center;
+  /* width clamps the banner to the viewport on narrow screens (the
+     transform: translateX(-50%) above would otherwise let the banner
+     extend off both edges). max-width caps it at a comfortable reading
+     width on desktop. */
+  width:calc(100vw - 2rem); max-width:32rem; box-sizing:border-box;
+}
+#snap-banner .snap-msg { flex:1; }
+#snap-banner button {
+  font-size:.6875rem; font-weight:600; font-family:inherit;
+  border-radius:.25rem; padding:.25rem .625rem; cursor:pointer;
+}
+#snap-banner .snap-recover { background:var(--go-bg); color:var(--go-fg); border:none; }
+#snap-banner .snap-dismiss { background:none; color:var(--bar-text); border:1px solid var(--seg-bd); }
+
+/* Section row layout — used by the Script section to lay out "Load file",
+   "Download script", and the Countdown toggle row. */
+.isec-row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+
+#info-foot { padding:.75rem 1.25rem; border-top:1px solid var(--panel-bd); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+#info-foot a { font-size:.8125rem; color:var(--bar-text); text-decoration:none; }
+#info-foot a:hover { color:var(--acc); }
+
+/* One-time toast shown when localStorage save fails (private-mode quota,
+   storage disabled, etc.). Non-modal, auto-dismisses after 5 seconds. */
+#save-toast { position:fixed; left:50%; top:1rem; transform:translateX(-50%); background:var(--seg-bg); color:var(--bar-text); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.5rem .875rem; font-size:.75rem; z-index:var(--z-toast); box-shadow:0 4px 14px rgba(0,0,0,0.4); transition:opacity .4s ease; max-width:24rem; text-align:center; }
+
+/* Keyboard-only users need to see where focus is. The default outline is
+   suppressed by `border:none` on most controls, so we add an explicit
+   ring on :focus-visible (mouse clicks don't trigger it). */
+button:focus-visible, .cinput:focus-visible, .val-input:focus-visible, input[type=range]:focus-visible, .cpre:focus-visible, .fpick:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+
+/* Respect users who prefer reduced motion: kill the bar slide and panel
+   fade. The acceleration curve is the product itself, so it stays. */
+@media (prefers-reduced-motion: reduce) {
+  #bar, #scroll, #cue-overlay, #info-overlay, #info-panel { transition: none !important; }
+}
+
+/* ── WORDMARK ── */
+/* Subtle product mark in the top-left while the prompter is at rest.
+   Hides on START so reading isn't visually competed with; reappears on
+   pause. position:fixed + pointer-events:none so it never blocks clicks
+   into the prose for editing. */
+#wordmark {
+  position: fixed;
+  top: 1.25rem;
+  left: 1.5rem;
+  font-family: system-ui, sans-serif;
+  font-size: .875rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: .01em;
+  z-index: var(--z-wordmark);
+  pointer-events: none;
+  transition: opacity .4s ease;
+}
+#wordmark.hidden { opacity: 0; }
+
+/* ── MULTI / DIALOGUE BUTTON ── */
+#btn-multi { flex-shrink:0; font-size:.625rem; font-weight:600; font-family:inherit; background:var(--seg-bg); border:1px solid var(--seg-bd); border-radius:.375rem; padding:.25rem .5rem; color:var(--bar-dim); cursor:pointer; transition:color .15s, border-color .15s; }
+#btn-multi.on { color:var(--bar-text); border-color:var(--acc); }
+#btn-multi:hover { opacity:.8; }
+
+/* ── SPEAKER LABEL ── */
+.sp-label { font-weight:700; }
+
+/* ── MOBILE / TOUCH (≤ 600px) ── */
+@media (max-width: 600px) {
+  #bar {
+    height: auto;
+    min-height: 2.75rem;
+    flex-wrap: wrap;
+    padding: .375rem .625rem;
+    gap: .375rem .5rem;
+    overflow-x: hidden;
+    align-items: center;
+  }
+  /* Larger tap targets — applies to the lean v1.1 bar (WPM, START,
+     Multi, Settings) only; the bar now contains far fewer buttons,
+     so each gets more visual weight. */
+  #btn-go    { min-height: 2.25rem; padding: .375rem 1.25rem; font-size: .875rem; }
+  #btn-multi { min-height: 2.25rem; padding: .375rem .75rem; }
+  #btn-info  { min-height: 2.25rem; padding: .375rem .75rem; }
+  #spd-sl    { width: 5.5rem; }
+  /* Info panel becomes a bottom sheet on mobile */
+  #info-panel   { width: 100%; max-width: 100%; max-height: 92vh; border-radius: .75rem .75rem 0 0; margin-top: auto; }
+  #info-overlay { align-items: flex-end; }
+  .itab         { padding: .625rem .625rem .5625rem; }
+}
+
+/* ── LANDSCAPE MOBILE (short viewport) ──
+   Phones in landscape have ~360–500px of vertical space; the wrap
+   behaviour kicks in earlier here, so we tighten paddings and gaps and
+   shorten the WPM slider so the bar stays on a single row whenever
+   possible. */
+@media (max-width: 900px) and (max-height: 500px) {
+  #bar {
+    height: auto;
+    min-height: 2.75rem;
+    flex-wrap: wrap;
+    overflow-x: hidden;
+    padding: .375rem .625rem;
+    gap: .375rem .5rem;
+  }
+  #btn-go { min-height: 2rem; padding: .25rem 1rem; }
+  #spd-sl { width: 5.5rem; }
+}
+</style>
+</head>
+<body>
+
+<div id="wordmark" aria-hidden="true">Ultrascript</div>
+
+<div id="scroll">
+  <div id="prose" contenteditable="true" spellcheck="false" autocorrect="off" autocapitalize="off" autocomplete="off"></div>
+</div>
+
+<div id="cue-overlay" aria-hidden="true">
+  <div id="cue-band" class="cue-ind"></div>
+  <div id="cue-line" class="cue-ind"></div>
+  <div id="cue-col">
+    <div id="cue-left" class="cue-ind"></div>
+  </div>
+</div>
+
+<div id="cd-overlay" aria-hidden="true">
+  <svg width="120" height="120" viewBox="0 0 120 120" style="filter:drop-shadow(0 0 12px rgba(0,0,0,0.4))">
+    <circle cx="60" cy="60" r="52" fill="none" stroke="var(--bar-bd)" stroke-width="4"/>
+    <circle id="cd-ring" cx="60" cy="60" r="52" fill="none" stroke="var(--bar-text)" stroke-width="4" stroke-linecap="round" stroke-dashoffset="0" transform="rotate(-90 60 60)"/>
+    <text id="cd-num" x="60" y="60" text-anchor="middle" dominant-baseline="central" font-size="42" font-weight="700" fill="var(--bar-text)" opacity="0.85" font-family="system-ui,sans-serif"></text>
+  </svg>
+</div>
+
+<div id="bar" role="toolbar" aria-label="Ultrascript controls">
+  <div class="grp">
+    <span class="lbl">WPM</span>
+    <input type="range" id="spd-sl" min="40" max="300" value="160" step="1" title="Words per minute — drag, or click the number to type an exact value">
+    <span class="val" id="spd-v" title="Click to type an exact WPM value">160</span>
+  </div>
+  <div class="bar-spacer"></div>
+  <span id="tmr" role="timer" title="Elapsed time" style="display:none;">0:00</span>
+  <button type="button" id="btn-go">START</button>
+  <button type="button" id="btn-multi" title="Multi-speaker mode" aria-label="Toggle multi-speaker mode" aria-pressed="false">Multi</button>
+  <button type="button" id="btn-info" title="Settings" aria-label="Open settings">Settings</button>
+</div>
+
+<div id="info-overlay">
+  <div id="info-panel">
+    <div id="info-head">
+      <span id="info-logo"><a href="https://ultrascript.vercel.app" target="_blank" rel="noopener">Ultrascript</a> <span id="version-label"></span></span>
+      <button id="btn-close-info" type="button" aria-label="Close settings" title="Close">✕</button>
+    </div>
+    <div id="info-tabs">
+      <button type="button" class="itab on" data-tab="guide">Guide</button>
+      <button type="button" class="itab" data-tab="preferences">Preferences</button>
+      <button type="button" class="itab" data-tab="script">Script</button>
+      <button type="button" class="itab" data-tab="multi">Multi-speaker</button>
+      <button type="button" class="itab" data-tab="science">Science</button>
+    </div>
+    <div id="info-body">
+
+      <!-- GUIDE TAB -->
+      <div class="tab-content on" id="tab-guide">
+        <div class="isec">
+          <h3>Getting started</h3>
+          <div class="irows">
+            <div class="irow"><span class="k">Add your script</span><span class="d">Click anywhere on screen and paste or type</span></div>
+            <div class="irow"><span class="k">Edit on the fly</span><span class="d">Click the text at any time — even while running — to fix a word</span></div>
+            <div class="irow"><span class="k">Stop editing</span><span class="d">Click outside the text or press <kbd>Esc</kbd></span></div>
+            <div class="irow"><span class="k">Auto-saved</span><span class="d">Script and all settings save automatically</span></div>
+          </div>
+        </div>
+        <div class="isep"></div>
+        <div class="isec">
+          <h3>Playback</h3>
+          <div class="irows">
+            <div class="irow"><span class="k">Start / Pause</span><span class="d">Click <strong>START</strong> or press <kbd>Space</kbd></span></div>
+            <div class="irow"><span class="k">Faster</span><span class="d"><kbd>W</kbd> or <kbd>↑</kbd></span></div>
+            <div class="irow"><span class="k">Slower</span><span class="d"><kbd>S</kbd> or <kbd>↓</kbd></span></div>
+            <div class="irow"><span class="k">Scroll manually</span><span class="d">Two-finger scroll anytime. Auto-scroll resumes after ~1 sec</span></div>
+            <div class="irow"><span class="k">Next speaker</span><span class="d"><kbd>Tab</kbd> or <kbd>→</kbd> — jumps to the next speaker line (Multi mode)</span></div>
+            <div class="irow"><span class="k">Countdown</span><span class="d">Toggle in <strong>Settings → Preferences</strong> — 3 sec countdown before scrolling</span></div>
+          </div>
+        </div>
+        <div class="isep"></div>
+        <div class="isec">
+          <h3>Pace reference (WPM)</h3>
+          <div class="irows">
+            <div class="irow"><span class="k">Conference / Keynote</span><span class="d">100–130 WPM — slow, deliberate</span></div>
+            <div class="irow"><span class="k">Podcast / Creator</span><span class="d">130–150 WPM — conversational</span></div>
+            <div class="irow"><span class="k">News anchor</span><span class="d">150–175 WPM — broadcast / monologue</span></div>
+            <div class="irow"><span class="k">Fast read</span><span class="d">175+ WPM — brisk reads, sermons in narrative mode</span></div>
+            <div class="irow"><span class="k">Scrub / rehearsal</span><span class="d">250+ WPM — speed-read for memorization</span></div>
+          </div>
+          <p class="iblurb" style="margin-top:.625rem;">Default sits at <strong>160 WPM</strong> — the centre of the news-anchor range. Bump down for slower reads, up for fast ones. WPM is approximate (depends on average word length in your script — ±~5%).</p>
+        </div>
+        <div class="isep"></div>
+        <div class="isec">
+          <h3>Controls</h3>
+          <div class="irows">
+            <div class="irow"><span class="k">WPM</span><span class="d">Drag slider or click the number to type an exact value</span></div>
+            <div class="irow"><span class="k">Size / Line</span><span class="d">In <strong>Settings → Preferences</strong> — drag or click the number</span></div>
+            <div class="irow"><span class="k">Reset</span><span class="d">In <strong>Settings → Preferences</strong> — restores WPM (160), size (1.75rem), line height (3.0)</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PREFERENCES TAB -->
+      <div class="tab-content" id="tab-preferences">
+
+        <div class="isec">
+          <button type="button" id="btn-reset" title="Restores WPM (160), size (1.75rem), line height (3.0)">Reset to defaults</button>
+        </div>
+
+        <div class="isec" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;">
+          <span style="font-size:.8125rem;color:var(--bar-text);">Countdown</span>
+          <button type="button" id="btn-cd" class="btn-pill" title="Toggle 3-second countdown" aria-label="Toggle 3-second countdown" aria-pressed="false">⏱  Countdown</button>
+        </div>
+
+        <div class="isec">
+          <h3>Theme</h3>
+          <div class="seg" id="theme-seg">
+            <button type="button" data-t="auto" class="on">Auto</button>
+            <button type="button" data-t="light">Light</button>
+            <button type="button" data-t="dark">Dark</button>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Profile</h3>
+          <p class="iblurb">Pick a profile to load a complete setup — font, size, line height, speed, theme, reading-line position, and cue. Tweak any control after to fine-tune; the picker switches to <strong>Custom</strong> when you do.</p>
+          <div class="profile-picks" id="profile-picks">
+            <button type="button" class="ppick" data-profile="newsroom"      title="Autocue/QTV broadcast standard — BBC, CNN, Sky-style anchor read">Newsroom</button>
+            <button type="button" class="ppick" data-profile="high-contrast" title="Autocue's documented high-contrast alternative: yellow-on-black">High Contrast</button>
+            <button type="button" class="ppick" data-profile="voiceover"     title="Studio booth pace — generous line height, slower read">Studio Voiceover</button>
+            <button type="button" class="ppick" data-profile="creator"       title="Podcast / YouTube conversational pace">Creator</button>
+            <button type="button" class="ppick" data-profile="vlog"          title="Phone-to-face recording — slightly faster, smaller font, energetic">Vlog</button>
+            <button type="button" class="ppick" data-profile="educator"      title="Classroom / lecture / explainer — slow explanation pace, eye-rest anchor, light theme">Educator</button>
+            <button type="button" class="ppick" data-profile="conference"    title="Keynote / TED slow deliberate pace, light theme, eye-rest anchor">Conference</button>
+            <button type="button" class="ppick" data-profile="speedread"     title="Fast scrub through a script for memorization or structure review (~250 WPM)">Speed Read</button>
+            <button type="button" class="ppick" data-profile="terminal"      title="Retro CRT vibe — system font, green-on-black">Terminal</button>
+            <button type="button" class="ppick ppick-custom" data-profile="custom" title="Your own settings (auto-selected when you nudge any control off-profile)">Custom</button>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Font</h3>
+          <div class="font-picks" id="font-picks">
+            <button type="button" class="fpick on" data-font="Georgia, 'Times New Roman', serif" style="font-family:Georgia,serif;">Georgia</button>
+            <button type="button" class="fpick" data-font="'Courier New', Courier, monospace" style="font-family:'Courier New',monospace;">Courier</button>
+            <button type="button" class="fpick" data-font="Arial, Helvetica, sans-serif" style="font-family:Arial,sans-serif;">Arial</button>
+            <button type="button" class="fpick" data-font="Verdana, Geneva, sans-serif" style="font-family:Verdana,sans-serif;">Verdana</button>
+            <button type="button" class="fpick" data-font="system-ui, sans-serif">System</button>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Size</h3>
+          <div class="grp" style="gap:.625rem;">
+            <input type="range" id="fnt-sl" min="1" max="5" value="1.75" step="0.05" style="width:10rem;">
+            <span class="val" id="fnt-v" title="Click to type an exact size">1.75</span>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Line height</h3>
+          <div class="grp" style="gap:.625rem;">
+            <input type="range" id="lh-sl" min="2.0" max="5.0" value="3.0" step="0.1" style="width:10rem;">
+            <span class="val" id="lh-v" title="Click to type an exact line height">3.0</span>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Color scheme</h3>
+          <div class="cpresets">
+            <div class="cpre on" data-fg="#f0ede6" data-bg="#111111" style="background:#111;color:#f0ede6;" title="Default — broadcast white-on-black">Aa</div>
+            <div class="cpre" data-fg="#ffeb3b" data-bg="#000000" style="background:#000;color:#ffeb3b;" title="Yellow — Autocue's documented high-contrast alternative for difficult readers">Aa</div>
+            <div class="cpre" data-fg="#00dd00" data-bg="#000000" style="background:#000;color:#00dd00;" title="Terminal — CRT phosphor green, retro vibe (not a broadcast standard)">Aa</div>
+            <div class="cpre" data-fg="#f5c97a" data-bg="#1a1008" style="background:#1a1008;color:#f5c97a;" title="Amber — long-persistence phosphor heritage, gentle on the eyes">Aa</div>
+            <div class="cpre" data-fg="#ffffff" data-bg="#000000" style="background:#000;color:#fff;" title="Pure white-on-black — maximum contrast">Aa</div>
+          </div>
+          <p id="color-override-note" style="display:none;font-size:.6875rem;color:var(--bar-text);margin-top:.5rem;">Custom color scheme active — overrides Auto / Light / Dark. Select a theme above to reset.</p>
+          <div class="ccustom">
+            <div class="crow">
+              <div class="csw" id="fg-sw" style="background:#f0ede6;"></div>
+              <span class="clbl">Text</span>
+              <div class="ctabs" id="fg-tabs">
+                <button type="button" class="on" data-m="hex">HEX</button>
+                <button type="button" data-m="rgb">RGB</button>
+              </div>
+              <input class="cinput" id="fg-in" type="text" value="#f0ede6">
+            </div>
+            <div class="crow">
+              <div class="csw" id="bg-sw" style="background:#111111;"></div>
+              <span class="clbl">BG</span>
+              <div class="ctabs" id="bg-tabs">
+                <button type="button" class="on" data-m="hex">HEX</button>
+                <button type="button" data-m="rgb">RGB</button>
+              </div>
+              <input class="cinput" id="bg-in" type="text" value="#111111">
+            </div>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Cue indicator</h3>
+          <div class="seg" id="cue-toggle">
+            <button type="button" data-cue="off" class="on">Off</button>
+            <button type="button" data-cue="on">On</button>
+          </div>
+          <div id="cue-options" style="display:none; flex-direction:column; gap:.625rem; margin-top:.625rem;">
+            <div class="seg" id="cue-style-seg">
+              <button type="button" data-cs="line" class="on">Line</button>
+              <button type="button" data-cs="band">Band</button>
+              <button type="button" data-cs="left">Left</button>
+              <button type="button" data-cs="fade">Fade</button>
+            </div>
+            <div class="cpresets" id="cue-presets">
+              <div class="cpre cue-pre" data-cp="autocue-red"   title="Autocue Red — documented broadcast cue marker"   style="--cue-pre-color:rgba(220,50,50,0.35);"><span class="cue-pre-fill"></span><span class="cue-pre-lbl">Red</span></div>
+              <div class="cpre cue-pre on" data-cp="qtv-white"  title="QTV White"     style="--cue-pre-color:rgba(255,255,255,0.20);"><span class="cue-pre-fill"></span><span class="cue-pre-lbl">QTV</span></div>
+              <div class="cpre cue-pre" data-cp="amber"         title="Amber"         style="--cue-pre-color:rgba(245,201,122,0.18);"><span class="cue-pre-fill"></span><span class="cue-pre-lbl">Amb</span></div>
+              <div class="cpre cue-pre" data-cp="invisible"     title="Invisible"     style="--cue-pre-color:rgba(255,255,255,0.07);"><span class="cue-pre-fill"></span><span class="cue-pre-lbl">Inv</span></div>
+              <!-- "Green" — pairs naturally with the Terminal scheme. The internal data-cp is "autocue-green" for backwards-compatibility with already-saved tp_cue_preset values; the user-facing label is just "Green" because, unlike Red, this isn't a documented Autocue color (it was named by analogy in early drafts). -->
+              <div class="cpre cue-pre" data-cp="autocue-green" title="Green"         style="--cue-pre-color:rgba(0,200,80,0.30);"><span class="cue-pre-fill"></span><span class="cue-pre-lbl">Grn</span></div>
+            </div>
+            <div class="ccustom">
+              <div class="crow">
+                <div class="csw" id="cue-sw" style="background:#ffffff;"></div>
+                <span class="clbl">Cue</span>
+                <div class="ctabs" id="cue-tabs">
+                  <button type="button" class="on" data-m="hex">HEX</button>
+                  <button type="button" data-m="rgb">RGB</button>
+                </div>
+                <input class="cinput" id="cue-in" type="text" value="#ffffff33">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="isec">
+          <h3>Reading line</h3>
+          <p class="iblurb">Where on screen the eye lands. <strong>Broadcast (33%)</strong> is the documented Autocue/QTV standard used by major newsrooms. <strong>Eye-rest (38%)</strong> sits a touch lower — comfortable for slow, deliberate reads.</p>
+          <div class="seg" id="anchor-seg">
+            <button type="button" data-anchor="0.33" class="on">Broadcast 33%</button>
+            <button type="button" data-anchor="0.38">Eye-rest 38%</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- SCRIPT TAB -->
+      <div class="tab-content" id="tab-script">
+
+        <div class="isec">
+          <h3>Script</h3>
+          <p class="iblurb">Your script is auto-saved in this browser. For cross-device or belt-and-braces backup, save it as a <code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">.txt</code> file or load one in.</p>
+          <div class="isec-row">
+            <button type="button" id="btn-import-script" class="btn-pill" title="Load a script from .txt, .md, or .json (replaces the current one — download first if you want to keep it)">Load from file…</button>
+
+            <button type="button" id="btn-download-script" class="btn-pill" title="Save the current script as a .txt file">Download script</button>
+            <input id="script-file-input" type="file" accept=".txt,.md,.json,text/plain,text/markdown,application/json" style="display:none;">
+          </div>
+        </div>
+
+      </div>
+
+      <!-- MULTI-SPEAKER TAB -->
+      <div class="tab-content" id="tab-multi">
+
+        <div class="isec">
+          <h3>Formats</h3>
+          <div class="sci-body">
+            <p>Three formats are supported — use whichever matches your script:</p>
+            <p style="margin-top:.5rem;font-family:monospace;font-size:.75rem;line-height:1.8;color:var(--bar-text);background:var(--seg-bg);padding:.5rem .625rem;border-radius:.375rem;border:1px solid var(--seg-bd);">ALEX: Have you seen the report?<br>Sarah: Not yet — send it over.<br><br>HOST:<br>DR SMITH: The results are in.<br><br>[Alex] Did you get my message?<br>[Dr Smith] The results are in.</p>
+            <p style="margin-top:.5rem;"><strong style="color:var(--bar-text)">Inline</strong> — name followed by colon and text on the same line.<br><strong style="color:var(--bar-text)">Standalone</strong> — name and colon alone on a line, text on the next.<br><strong style="color:var(--bar-text)">Bracket</strong> — name in square brackets, text follows. <strong style="color:var(--bar-text)">ALL-CAPS</strong> or <strong style="color:var(--bar-text)">Title Case</strong>, up to three words. Use <strong style="color:var(--bar-text)">Re-parse</strong> after editing the script.</p>
+            <div style="margin-top:.75rem;display:flex;align-items:center;gap:.5rem;">
+              <button type="button" id="btn-copy-prompt" class="btn-pill">Copy AI prompt</button>
+              <span style="font-size:.75rem;color:var(--bar-text);">Paste your raw script into any AI to get it formatted for Multi.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="isec" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;">
+          <div>
+            <h3>Compact spacing</h3>
+            <p class="iblurb" style="margin-top:.25rem;">Collapses blank lines between speakers. Turn off if blank lines are intentional pauses.</p>
+          </div>
+          <button type="button" id="btn-compact-speakers" class="btn-pill on" aria-pressed="true" style="flex-shrink:0;">Compact: On</button>
+        </div>
+
+        <div class="isec">
+          <h3>Speakers</h3>
+          <div id="dialogue-empty" style="font-size:.8125rem;color:var(--bar-text);">No speakers detected yet. Enable Multi to parse.</div>
+          <div id="dialogue-speakers" style="display:none;flex-direction:column;gap:.5rem;"></div>
+          <button type="button" id="btn-reparse" class="btn-pill" style="display:none;margin-top:.625rem;">Re-parse script</button>
+        </div>
+
+      </div>
+
+      <!-- SCIENCE TAB -->
+      <div class="tab-content" id="tab-science">
+        <div class="sci-body">
+          <div>
+            <h4>Acceleration curves</h4>
+            <p>Most teleprompter apps scroll at a constant pixel-per-frame rate. It works, but it feels mechanical — like a conveyor belt. Real broadcast teleprompters (Autocue, QTV) model how the human eye actually reads.</p>
+            <p>When your eye hits a line it accelerates into the text, reads at speed through the middle, then decelerates at the end — where it briefly pauses before jumping back to the left margin to start the next line. This micro-pause is what gives the reader a moment to reset without losing their place.</p>
+            <p>This app drives the curve in the time domain, not the pixel domain. On each line boundary crossing, a timer starts. Progress through the line is measured as elapsed time divided by the expected line duration at the current speed. This means the curve is accurate regardless of font, line height, or window size — it never drifts.</p>
+            <p>The velocity shape is an asymmetric piecewise curve: fast ease-in over the first 40% of the line (the eye locks on quickly), a flat peak through the middle 25% at full speed, then a slower ease-out over the final 35% (the eye needs more time to disengage and jump back to the margin). The curve is normalized so the weighted average velocity equals exactly the speed you set — set speed to 6, you get speed 6 on average, not 5.4 or 6.3.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>Speed and WPM</h4>
+            <p>Speed is set in words-per-minute, the unit broadcasters and voice coaches actually use. The default sits at 160 WPM — the centre of the news-anchor band. Internally the engine drives off a pixels-per-millisecond rate that's recomputed from your WPM whenever font size or line height change, so the perceived read pace stays constant when you resize type — a bigger font no longer secretly slows the read.</p>
+            <p>WPM is approximate. The conversion assumes ~6.4 words per line at the default column width and average English word length; real scripts vary by ±5% depending on word length and punctuation density. Professional news anchors read at 150–175 WPM; public speakers and educators typically use 100–130. When nervous, people rush — set your WPM 5–10% slower than feels right during practice.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>Reading line</h4>
+            <p>The reading line is where on screen your eye lands. The default is 33% from the top — the documented Autocue/QTV broadcast standard used by major newsrooms (BBC, CNN, Sky News). This places the read in the upper third of the screen, leaving the lower two-thirds for peripheral preview of upcoming text. The eye fatigue this prevents on long reads is the entire point of the convention.</p>
+            <p>An <strong>Eye-rest (38%)</strong> alternative is offered in Preferences for slow, deliberate reads where the reader benefits from a touch more text above the line. Public speaking and keynote profiles use this position because the slow pace gives time to absorb context.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>Profiles</h4>
+            <p>Profiles are one-click setups grounded in real industry conventions. <strong>Newsroom</strong> mirrors the Autocue/QTV white-on-black anchor read used by major broadcasters (BBC, CNN, Sky). <strong>High Contrast</strong> is Autocue's documented yellow-on-black alternative for difficult readers. <strong>Studio Voiceover</strong> runs the slower, breathier pace common to audiobook and commercial booths. <strong>Creator</strong> is conversational, for podcast and YouTube. <strong>Vlog</strong> is for phone-to-face recording — slightly faster, smaller font, energetic. <strong>Educator</strong> matches classroom / lecture pace with a generous line height for absorption and an eye-rest anchor for context. <strong>Conference</strong> drops to keynote / TED pace with a light theme. <strong>Speed Read</strong> is a fast scrub through the script for memorization or structure review. <strong>Terminal</strong> is the one aesthetic profile — green-on-black is a CRT phosphor heritage from 1970s/80s computer terminals (IBM 5151, DEC, Amdek), not a broadcast convention.</p>
+            <p>Pick a profile to load a complete setup. Tweak any control after — the picker switches to <strong>Custom</strong> the moment you nudge anything off-profile, so the highlighted pill always reflects truth.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>Typography</h4>
+            <p>Line height matters more than font size for reading comfort. Tight lines force the eye to work harder to find the next line. This app defaults to 3.0 line height — generous by web standards but correct for teleprompter use. Professional systems often go higher.</p>
+            <p>Georgia is the default because it was designed specifically for screen legibility — wider letterforms, heavier strokes. Courier New is the traditional broadcast script format used for decades. Arial and Verdana are both purpose-built for screen rendering at distance. The Newsroom and High Contrast profiles use Arial because Autocue's documentation explicitly recommends sans-serif (Arial, Tahoma, Verdana) for broadcast.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>Multi-speaker mode</h4>
+            <p>The parser walks each paragraph block and tests it against three patterns in order: an inline colon label (<code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">ALEX: text</code>), a standalone colon label (<code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">HOST:</code> alone on a line), and a bracket label (<code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">[Alex] text</code>). Speaker names are normalized to uppercase so <code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">Alex</code> and <code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">ALEX</code> resolve to the same speaker.</p>
+            <p>Mid-paragraph speakers are detected too. Pasted scripts often pack multiple turns into one block — <code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">"...the question. RHIAN: Yes. TORJE: Hmm."</code> — and a pre-processing pass splits any such block into one paragraph per speaker before parsing. Each turn ends up on its own line, coloured correctly. The Copy AI prompt button gives you a reformatter prompt with explicit guidance to keep speakers on separate lines, so cleaned-up source produces cleaner output.</p>
+            <p>Colors are applied via an injected stylesheet rather than inline style attributes, so they survive the browser's contenteditable sanitizer. If a false positive is detected (a stage direction or sentence fragment that looks like a speaker), tap ✕ next to that row to exclude it — this unwraps its colored spans without affecting any other speakers.</p>
+          </div>
+          <div class="isep"></div>
+          <div>
+            <h4>How it's built</h4>
+            <p>A single HTML file — no server, no accounts, no tracking. Everything runs locally in your browser. Script and settings are stored in <code style="font-family:monospace;font-size:.75rem;background:var(--seg-bg);padding:.0625rem .25rem;border-radius:.1875rem;">localStorage</code> and never leave your device.</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+    <div id="info-foot">
+      <a href="https://heypaul.xyz" target="_blank" rel="noopener">heypaul.xyz</a>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+var VERSION = '1.1.0';
+
+/* ═══════ ERROR HANDLING ═══════ */
+/* Two-layer safety net so an unexpected throw never leaves the user with
+   a frozen prompter and no signal:
+   1. window.onerror catches anything outside the RAF loop (handlers,
+      load(), etc.) and surfaces a red toast so the user knows to reload.
+   2. The RAF loop body itself is wrapped in try/catch (see loop()) which
+      additionally cancels and nulls `raf`, drops `running`, and shows the
+      bar so doStart's `if(!raf)` guard can recover on the next press. */
+window.onerror = function(msg, src, line, col, err) {
+  showErrorToast('Unexpected error — please reload. (' + (msg || 'unknown') + ')');
+  return false;
+};
+
+/* Non-modal error toast at the top of the viewport. Distinct from
+   showSaveToast (which uses CSS variables and lives at the same anchor).
+   Inline styles only — this may fire before the theme is applied or
+   while the document is in an inconsistent state. */
+function showErrorToast(msg) {
+  var t = document.createElement('div');
+  t.textContent = msg;
+  /* z-index inlined as a literal CSS variable reference. Modern browsers
+     resolve var() inside inline style.cssText fine; if the variable is
+     undefined (defensive — shouldn't happen post-init), 9999 is a safe
+     fallback higher than any other layer in the stack. */
+  t.style.cssText = [
+    'position:fixed', 'top:0', 'left:0', 'right:0',
+    'z-index:var(--z-error,9999)',
+    'background:#c0392b', 'color:#fff', 'font-size:.8125rem',
+    'font-family:system-ui,sans-serif', 'padding:.625rem 1rem',
+    'text-align:center', 'pointer-events:none'
+  ].join(';');
+  document.body.appendChild(t);
+  setTimeout(function() { t.parentNode && t.parentNode.removeChild(t); }, 8000);
+}
+
+/* ═══════ BAR AUTO-HIDE ═══════ */
+var barHideTimer = null;
+var barVisible = true;
+
+function showBar() {
+  var bar = document.getElementById('bar');
+  /* Only read offsetHeight (which forces a layout flush) when the bar is
+     actually transitioning from hidden → visible. While the bar is already
+     visible, the ResizeObserver keeps --bar-h current, so reading
+     offsetHeight on every mousemove/keydown is pure waste. */
+  if (!barVisible) {
+    bar.classList.remove('hidden');
+    document.documentElement.style.setProperty('--bar-h', bar.offsetHeight + 'px');
+    barVisible = true;
+  }
+  scheduleHide();
+}
+
+function hideBar() {
+  document.getElementById('bar').classList.add('hidden');
+  document.documentElement.style.setProperty('--bar-h', '0px');
+  barVisible = false;
+}
+
+function scheduleHide() {
+  clearTimeout(barHideTimer);
+  if (running) {
+    barHideTimer = setTimeout(hideBar, BAR_HIDE_AFTER_MS);
+  }
+}
+
+function wakeBar() {
+  showBar();
+}
+
+/* wake on any mouse move, touch, key. Wheel wake is folded into the
+   passive:false wheel handler below so we don't register two wheel
+   listeners on the same target. */
+document.addEventListener('mousemove', wakeBar);
+document.addEventListener('touchstart', wakeBar);
+document.addEventListener('keydown', wakeBar);
+
+/* ── Bar height tracking ──
+   ResizeObserver fires whenever the bar's rendered size changes — on
+   load, on orientation change, and when the bar wraps to a second row
+   on narrow mobile screens. It updates --bar-h so every consumer
+   (#scroll, #cue-overlay, #cd-overlay) tracks via CSS without any
+   imperative style writes scattered around the codebase.
+   Guard: only update while the bar is visible; hideBar() already sets
+   --bar-h to 0px and the transform hide doesn't affect layout size. */
+(function() {
+  var barEl = document.getElementById('bar');
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(function() {
+      if (barVisible) {
+        document.documentElement.style.setProperty('--bar-h', barEl.offsetHeight + 'px');
+      }
+    }).observe(barEl);
+  } else {
+    /* Fallback for very old browsers: sync on resize and load */
+    function syncBarH() {
+      if (barVisible) document.documentElement.style.setProperty('--bar-h', barEl.offsetHeight + 'px');
+    }
+    window.addEventListener('resize', syncBarH);
+    syncBarH();
+  }
+})();
+
+/* ═══════ THEME ═══════ */
+var mq = window.matchMedia('(prefers-color-scheme: dark)');
+var theme = 'auto';
+function applyTheme(t) {
+  document.documentElement.dataset.theme = (t==='dark'||(t==='auto'&&mq.matches)) ? 'dark' : 'light';
+}
+function setTheme(t) {
+  theme=t; applyTheme(t);
+  document.querySelectorAll('#theme-seg button').forEach(function(b){ b.classList.toggle('on',b.dataset.t===t); });
+  /* Theme toggle always takes full control — clear any custom color scheme
+     (inline overrides on prose/scroll/body) and sync JS color state to the
+     theme's rendered defaults so swatches and inputs reflect reality. */
+  customColorsActive = false;
+  document.getElementById('prose').style.color = '';
+  document.getElementById('scroll').style.background = '';
+  document.body.style.background = '';
+  var isLight = document.documentElement.dataset.theme === 'light';
+  fgColor = isLight ? '#1a1814' : '#f0ede6';
+  bgColor = isLight ? '#f5f2eb' : '#111111';
+  document.getElementById('fg-sw').style.background = fgColor;
+  document.getElementById('bg-sw').style.background = bgColor;
+  syncColorInput('fg', fgColor); syncColorInput('bg', bgColor);
+  document.querySelectorAll('.cpre').forEach(function(p){ if(!p.dataset.cp) p.classList.remove('on'); });
+  var note = document.getElementById('color-override-note');
+  if(note) note.style.display = 'none';
+  syncCueToTheme();
+  save();
+}
+/* MediaQueryList listener registration. Safari < 14 (still in the field
+   on older iPhones / iPads that can't update past iOS 12–13) doesn't
+   support addEventListener on MediaQueryList — only the legacy addListener.
+   Modern Safari (14+) supports both. Try the modern API first, fall back
+   to the deprecated one. */
+function _onSchemeChange(){
+  /* Skip OS-driven theme reapplication while a custom color scheme is
+     active. applyColors() has already pinned data-theme to whatever the
+     bg luminance dictates; calling applyTheme('auto') here would override
+     that with the OS preference and desync the bar/chrome from the prose
+     colors. The user already opted out of theme-following the moment
+     they applied a custom scheme. */
+  if(theme==='auto' && !customColorsActive){
+    applyTheme('auto');
+    if(!cueColorCustomized) syncCueToTheme();
+  }
+}
+if (mq.addEventListener) mq.addEventListener('change', _onSchemeChange);
+else if (mq.addListener) mq.addListener(_onSchemeChange);
+document.querySelectorAll('#theme-seg button').forEach(function(b){
+  b.addEventListener('click', function(){ setTheme(b.dataset.t); });
+});
+
+/* ═══════ STATE ═══════ */
+var running=false, offset=0, lastTs=null, isManual=false, manualTmr=null;
+var secs=0, tickInt=null, raf=null;
+/* `wpm` is the user-facing value (industry-standard unit, persisted as
+   tp_wpm). `speed` is the engine's px/ms calibration unit — derived from
+   wpm + current font + line height via `wpmToSpeed()`, recomputed
+   whenever font or line height changes so the perceived read pace stays
+   constant when the user resizes type. */
+var wpm=160, speed=0, cdOn=false, cdActive=false;
+var fgColor='#f0ede6', bgColor='#111111', fgMode='hex', bgMode='hex';
+/* True when the user has applied a custom color scheme (Aa preset or typed color)
+   that overrides the theme. setTheme() clears it so the theme can take over fully. */
+var customColorsActive=false;
+var currentFont="Georgia, 'Times New Roman', serif";
+/* Suppresses save() while load() restores state — otherwise setTheme()
+   and applyColors() trigger save() before cd/font/cue state has been
+   restored, overwriting the user's saved values with init defaults. */
+var _loading=false;
+
+/* ── Dialogue / multi-speaker state ── */
+var multiOn = false;
+var compactSpeakers = true; /* collapse blank lines between speaker turns in Multi mode */
+var dialogueSpeakers = []; /* [{name, key, color}] in order of first appearance */
+var DIALOGUE_PALETTE = [
+  '#5b9cf6', /* blue   */
+  '#f97066', /* coral  */
+  '#34d399', /* green  */
+  '#fbbf24', /* amber  */
+  '#c084fc', /* purple */
+  '#fb923c', /* orange */
+  '#22d3ee', /* cyan   */
+  '#f472b6'  /* pink   */
+];
+
+/* ── Tuned constants ──
+   Promoted from inline magic numbers so a future drift is easy to spot.
+   SPEED_PX_PER_MS_UNIT      pixels per ms per engine `speed` unit. The
+                             engine drives off `speed`, and the user-facing
+                             WPM is converted to/from `speed` by the
+                             wpmToSpeed / speedToWPM pair (see the comment
+                             above _wpmConstant() for the closed-form
+                             formula). The 0.00576 calibration was chosen
+                             so default WPM=160 at fs=1.75 / lh=3.0 reads
+                             at the documented news-anchor pace.
+   COUNTDOWN_DURATION_MS     full sweep of the countdown ring + numbers.
+   COUNTDOWN_RING_CIRC       ring circumference; 2π × r=52 ≈ 326.726.
+   MANUAL_SCROLL_RESUME_MS   inactivity window before auto-scroll resumes
+                             after a wheel/two-finger nudge.
+   BAR_HIDE_AFTER_MS         idle window before the control bar fades out
+                             (only armed while running).
+   CUE_BAND_HEIGHT_LINES     band-style cue height in line-heights. */
+var SPEED_PX_PER_MS_UNIT    = 0.00576;
+var COUNTDOWN_DURATION_MS   = 3000;
+var COUNTDOWN_RING_CIRC     = 326.7;
+var MANUAL_SCROLL_RESUME_MS = 900;
+var BAR_HIDE_AFTER_MS       = 3000;
+var CUE_BAND_HEIGHT_LINES   = 1.5;
+/* Reading-line anchor — JS mirror of the --reading-anchor CSS variable.
+   0.33 (broadcast) is the documented Autocue/QTV default; 0.38 (eye-rest)
+   is offered as an alternative for slow / deliberate reads. setReadingAnchor()
+   keeps both copies in sync so CSS positioning and JS skip math agree. */
+var READING_ANCHOR          = 0.33;
+/* Fallback words-per-line value used by `getWordsPerLine()` only when
+   the prose hasn't laid out yet (very early load) or the live canvas
+   measurement returns a non-finite result. 6.4 was the desktop calibration
+   under the pre-1.0.1 fixed-constant approach: English text in a 36rem
+   column at Georgia 1.75rem averages ~6.4 words per line (≈35 chars /
+   5.5 chars-per-word). On the happy path the live measurement supplants
+   this; the constant is kept so the fallback path has a sane default
+   instead of a hard-coded literal. */
+var WORDS_PER_LINE_AVG      = 6.4;
+/* Bind the countdown ring's stroke-dasharray to the same constant as
+   COUNTDOWN_RING_CIRC so the SVG attribute can't drift out of sync. */
+(function(){
+  var ring=document.getElementById('cd-ring');
+  if(ring) ring.setAttribute('stroke-dasharray', COUNTDOWN_RING_CIRC);
+})();
+
+/* Cue indicator state. cueColor stores the active CSS color string —
+   may be hex (custom override) or rgba(...) (named preset). cuePreset
+   names the active named preset, or 'custom' when the user typed in
+   the input. cueColorCustomized pins the user's choice so changing
+   the FG/BG scheme won't auto-recolor the cue. */
+var cueOn=false, cueStyle='line', cueColor='rgba(255,255,255,0.20)';
+var cuePreset='qtv-white', cueColorCustomized=false, cueMode='hex';
+var CUE_PRESET_COLORS = {
+  'autocue-red':   'rgba(220,50,50,0.35)',
+  'autocue-green': 'rgba(0,200,80,0.30)',
+  'qtv-white':     'rgba(255,255,255,0.20)',
+  'amber':         'rgba(245,201,122,0.18)',
+  'invisible':     'rgba(255,255,255,0.07)'
+};
+/* Maps active FG|BG scheme to its preferred cue preset. Key format
+   is `fg|bg` (lowercase hex). Used only when !cueColorCustomized. */
+var CUE_DEFAULTS_BY_SCHEME = {
+  '#f0ede6|#111111': 'qtv-white',     /* Default            */
+  '#ffeb3b|#000000': 'qtv-white',     /* Yellow (autocue HC) */
+  '#00dd00|#000000': 'autocue-green', /* Terminal (green)   */
+  '#f5c97a|#1a1008': 'amber',         /* Amber              */
+  '#ffffff|#000000': 'qtv-white'      /* Pure white         */
+};
+
+/* Single path for auto-picking the cue preset.
+   Reads the effective data-theme (which applyColors keeps in sync with
+   the actual background luminance) so the cue is always legible:
+   light backgrounds get autocue-red; dark backgrounds use the fg|bg map. */
+function syncCueToTheme() {
+  if (cueColorCustomized) return;
+  var isLight = document.documentElement.dataset.theme === 'light';
+  var preset = isLight
+    ? 'autocue-red'
+    : (CUE_DEFAULTS_BY_SCHEME[fgColor+'|'+bgColor] || 'qtv-white');
+  setCuePreset(preset, false);
+}
+
+/* ═══════ ACCELERATION ENGINE (time-domain) ═══════ */
+/* Drive the curve from time elapsed since the last line boundary
+   was crossed, not from scroll position.
+   lineHeightPx = computed from CSS font-size × root px × line-height.
+   On each boundary crossing we record the timestamp and drive
+   progress = elapsed / expectedLineDuration.
+   Asymmetric piecewise curve: fast ease-in, flat peak, slow ease-out. */
+
+var lineHeightPx = 0;
+var lastBoundaryTs = null;   /* timestamp of last boundary crossing */
+var accumulator = 0;         /* sub-pixel accumulator */
+
+/* ── Layout cache ──
+   Reading scrollHeight/clientHeight forces a layout flush. Inside the
+   RAF loop that read happens every accumulator-overflow frame (every
+   2–3 frames at default speed). We cache the value and invalidate it
+   only when something that could change it actually changes — text
+   edits, font/line/font-family changes, window resize, or doStart. */
+var _maxOffset = 0;
+var _layoutDirty = true;
+function invalidateLayout(){ _layoutDirty = true; }
+function refreshLayout(){
+  var sc=document.getElementById('scroll');
+  var pr=document.getElementById('prose');
+  var max=pr.scrollHeight - sc.clientHeight;
+  if(max<0) max=0;
+  _maxOffset=max;
+  _layoutDirty=false;
+}
+
+function computeLineHeight() {
+  var rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  var fntRem = parseFloat(document.getElementById('fnt-sl').value) || 1.75;
+  var lh     = parseFloat(document.getElementById('lh-sl').value)  || 3.0;
+  lineHeightPx = fntRem * rootPx * lh;
+}
+
+/* Asymmetric piecewise curve: t=0..1, returns velocity multiplier.
+   Fast in (0→0.4): accelerates quickly as eye locks on.
+   Peak (0.4→0.65): full speed mid-line.
+   Slow out (0.65→1.0): gentle deceleration, eye prepares to jump.
+
+   Constants chosen so the curve is C0-continuous (no velocity jump at
+   segment joins) AND the time-weighted average equals exactly 1.0:
+
+     A: 0.80 + 0.3312 * smoothstep(s)        s = t/0.4              0.80 → 1.1312
+     B: 1.1312                                                       (flat peak)
+     C: 0.76 + 0.3712 * (1 - smoothstep(s2)) s2 = (t-0.65)/0.35     1.1312 → 0.76
+
+   Average:
+     A contrib: 0.40 * (0.80 + 0.3312/2) = 0.38624
+     B contrib: 0.25 * 1.1312            = 0.28280
+     C contrib: 0.35 * (0.76 + 0.3712/2) = 0.33096
+     Total = 1.00000 ✓
+   Asymmetry: ramp-up lift (0.3312) is smaller than ramp-down lift
+   (0.3712) because the eye starts higher than it ends. */
+function bezierMultiplier(t) {
+  var v;
+  if (t < 0.4) {
+    var s = t / 0.4;
+    var sm = s * s * (3 - 2*s); /* smoothstep 0→1 */
+    v = 0.80 + 0.3312 * sm;
+  } else if (t < 0.65) {
+    v = 1.1312;
+  } else {
+    var s2 = (t - 0.65) / 0.35;
+    var sm2 = s2 * s2 * (3 - 2*s2);
+    v = 0.76 + 0.3712 * (1 - sm2);
+  }
+  return v;
+}
+
+function getVelocityMultiplier(ts) {
+  if (!lastBoundaryTs || lineHeightPx <= 0) return 1.0;
+
+  /* expected duration of one line at current speed */
+  var lineDuration = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+
+  var elapsed = ts - lastBoundaryTs;
+  /* Clamp t to [0, 1]. Upper bound shouldn't be exceeded in practice
+     (we re-sync the boundary on each crossing), but the lower bound
+     guards against negative `elapsed` values from RAF/performance.now
+     clock-origin mismatches and the manual-resume backdate's
+     floating-point edge cases — without the Math.max(0,...), a small
+     negative t produces a 1-frame velocity blip ~0.86 instead of 0.80. */
+  var t = Math.max(0, Math.min(elapsed / lineDuration, 1.0));
+  return bezierMultiplier(t);
+}
+
+function syncBoundary(ts) {
+  /* Called when we cross into a new line. */
+  lastBoundaryTs = ts;
+}
+
+/* ═══════ LOOP ═══════ */
+/* RAF chain is scheduled BEFORE the body runs so `raf` always holds the
+   live handle. If the body throws, the catch block cancels the queued
+   frame and nulls `raf` — without this, a stale handle would convince
+   `doStart`'s `if(!raf)` guard that the loop is still running, leaving
+   the user with a permanently frozen prompter and no signal. */
+function loop(ts) {
+  raf = requestAnimationFrame(loop);
+  try {
+    if (lastTs===null) { lastTs=ts; }
+    var dt = Math.min(ts-lastTs, 32); lastTs=ts;
+
+    if (running && !isManual) {
+      if (lineHeightPx <= 0) computeLineHeight();
+
+      /* detect line boundary crossing */
+      if (lineHeightPx > 0) {
+        var prevLine = Math.floor(offset / lineHeightPx);
+        var mult = getVelocityMultiplier(ts);
+        var delta = speed * SPEED_PX_PER_MS_UNIT * dt * mult;
+        accumulator += delta;
+
+        if (accumulator >= 1) {
+          var px = Math.floor(accumulator);
+          accumulator -= px;
+          var newOffset = offset + px;
+
+          /* check if we crossed a boundary */
+          var newLine = Math.floor(newOffset / lineHeightPx);
+          if (newLine > prevLine) syncBoundary(ts);
+
+          offset = newOffset;
+          /* Clamp upper bound only — offset only ever grows here (px ≥ 1),
+             so it can never go negative once `max` itself is floored at 0.
+             The wheel handler does its own [0, max] clamp because deltaY
+             can be negative. Layout cache avoids reading scrollHeight every
+             frame (forced reflow). */
+          if (_layoutDirty) refreshLayout();
+          if (offset > _maxOffset) offset = _maxOffset;
+          document.getElementById('scroll').scrollTop = offset;
+        }
+      }
+    }
+  } catch (err) {
+    /* Tear down the playback session so the user can recover with a
+       reload (or another START press once they've cleared the cause).
+       running=false and showBar() bring the UI back to a controllable
+       state; the toast tells them what happened.
+       Also clear the side-state that would otherwise resume on the
+       next START:
+         - isManual would block the loop body for up to
+           MANUAL_SCROLL_RESUME_MS post-restart.
+         - manualTmr would fire later and overwrite freshly-set
+           boundary state.
+         - An in-flight skip-animation step (matching its captured
+           _skipAnimGen) would keep writing offset until it lands.
+           Bumping _skipAnimGen invalidates any queued step on its
+           next frame check. */
+    cancelAnimationFrame(raf);
+    raf = null;
+    running = false;
+    isManual = false;
+    clearTimeout(manualTmr); manualTmr = null;
+    _skipAnimGen++;
+    /* Mirror the full pause-path cleanup so the UI returns to rest state.
+       Without these, the timer interval keeps ticking, the button stays
+       labelled "PAUSE", the timer element stays visible, and the wordmark
+       stays hidden — leaving the interface stranded in a broken active state. */
+    clearInterval(tickInt); tickInt = null;
+    secs = 0; updTmr();
+    document.getElementById('btn-go').textContent = 'START';
+    document.getElementById('tmr').style.display = 'none';
+    document.getElementById('wordmark').classList.remove('hidden');
+    showBar();
+    showErrorToast('Playback error — please reload. (' + (err && err.message ? err.message : 'unknown') + ')');
+  }
+}
+
+/* ═══════ TIMER ═══════ */
+function updTmr(){ var m=Math.floor(secs/60),s=secs%60; document.getElementById('tmr').textContent=m+':'+(s<10?'0':'')+s; }
+function startTick(){ if(tickInt)return; tickInt=setInterval(function(){ if(running){secs++;updTmr();} },1000); }
+
+/* ═══════ PLAY/PAUSE ═══════ */
+var btnGo = document.getElementById('btn-go');
+
+function doStart(){
+  running=true; btnGo.textContent='PAUSE'; lastTs=null;
+  accumulator=0;
+  computeLineHeight();
+  invalidateLayout();
+  /* Re-sync `offset` from the actual scrollTop. While the user was editing
+     prose, the browser may have shifted scrollTop to follow the caret
+     (despite #scroll's overflow:hidden — iOS/Android and contenteditable
+     caret tracking still move it). The paste handler already syncs on
+     paste; doing it here covers the edit-and-press-START path so playback
+     resumes from where the user is actually looking, not where the engine
+     last left `offset`. */
+  offset = document.getElementById('scroll').scrollTop;
+  /* Timer no longer resets on START — pause is the reset moment. The pause
+     branch of btnGo's click handler zeroes `secs` and calls updTmr() so the
+     prompter returns to a clean rest state every time. This means: fresh
+     start → read → pause = timer shows total elapsed and disappears with
+     the timer reset; START again starts the next read at 0:00. There's no
+     resume-from-mid-read path because pause is always a full stop. */
+  /* Backdate lastBoundaryTs to the correct sub-line phase. Setting it to
+     `now` would restart the velocity curve at t=0 (slow ease-in) every
+     time playback resumes, regardless of where in the line the offset
+     actually sits — visible as a velocity blip on every resume from
+     pause. Same formula the wheel/touch resume handlers and the skip
+     animation use; doStart was the missing case. computeLineHeight()
+     above guarantees lineHeightPx is fresh; the >0 / speed>0 guards
+     mirror the established pattern. */
+  if (lineHeightPx > 0 && speed > 0) {
+    var fracDS = (offset % lineHeightPx) / lineHeightPx;
+    var lineDurDS = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+    lastBoundaryTs = performance.now() - fracDS * lineDurDS;
+  } else {
+    lastBoundaryTs = performance.now();
+  }
+  startTick();
+  /* Restart the RAF loop if it was cancelled on the previous pause. */
+  if(!raf) raf = requestAnimationFrame(loop);
+  /* Blur the prose first — focused contenteditable also acts as the
+     "active element" indicator (caret), and START's intent is "stop
+     editing and play". Then hide the wordmark so the reading area is
+     completely free of UI noise, and reveal the elapsed timer next to
+     START so the speaker can pace themselves. */
+  var prose = document.getElementById('prose');
+  if (document.activeElement === prose) prose.blur();
+  document.getElementById('wordmark').classList.add('hidden');
+  document.getElementById('tmr').style.display = '';
+  scheduleHide();
+}
+
+/* `cdRaf` holds the in-flight RAF handle so cancelCountdown can stop
+   the animation cleanly. Without this, a user action that wants to
+   pause (Multi, Re-parse, file import, ✕ exclusion,
+   snapshot recover) fired during the 3-second countdown window would
+   either be silently ignored — `if (running) btnGo.click();` is a
+   no-op because running is still false during countdown — or worse,
+   would mutate prose mid-flight and then `cb()` would fire doStart
+   on the modified DOM after the animation completed. */
+var cdRaf = null;
+function doCountdown(cb){
+  cdActive=true;
+  var overlay=document.getElementById('cd-overlay');
+  var numEl=document.getElementById('cd-num');
+  var ring=document.getElementById('cd-ring');
+  var C=COUNTDOWN_RING_CIRC;
+  overlay.style.display='flex';
+  var start=null;
+  numEl.textContent='3'; ring.style.strokeDashoffset='0';
+  function frame(ts){
+    if(!start) start=ts;
+    var p=Math.min((ts-start)/COUNTDOWN_DURATION_MS,1);
+    ring.style.strokeDashoffset=C*p;
+    var n=Math.ceil(3-p*3); if(n<1)n=1;
+    numEl.textContent=n;
+    if(p<1){ cdRaf=requestAnimationFrame(frame); }
+    else{ cdRaf=null; overlay.style.display='none'; cdActive=false; cb(); }
+  }
+  cdRaf=requestAnimationFrame(frame);
+}
+function cancelCountdown(){
+  if(cdRaf){ cancelAnimationFrame(cdRaf); cdRaf=null; }
+  document.getElementById('cd-overlay').style.display='none';
+  cdActive=false;
+}
+/* Single "stop whatever's happening" entry point used by every prose-
+   mutating handler. Returns true if it actually changed state — the
+   callers don't currently use the return value but it's there for future
+   handlers that want to branch on "did we just stop something?". */
+function pauseOrCancel(){
+  if(cdActive){ cancelCountdown(); return true; }
+  if(running){ btnGo.click(); return true; }
+  return false;
+}
+
+btnGo.addEventListener('click', function(){
+  if(cdActive) return;
+  if(!running){
+    if(cdOn){ document.getElementById('prose').blur(); doCountdown(doStart); }
+    else{ doStart(); }
+  } else {
+    running=false; btnGo.textContent='START';
+    clearInterval(tickInt); tickInt=null;
+    /* Reset the elapsed timer here, not on START. Pause is the explicit
+       "return to rest" moment — the next START is a fresh read from 0:00.
+       Zero the seconds and refresh the visible value before tucking the
+       element away so it never flashes a stale count if some future
+       change leaves #tmr visible briefly during the transition. */
+    secs = 0; updTmr();
+    /* Cancel the RAF loop — no need to spin at 60fps while paused. */
+    cancelAnimationFrame(raf); raf=null;
+    /* Tear down side-state so it can't leak into the next START. The
+       previous version left these alive on user-driven pauses (only the
+       loop's catch block cleared them):
+         - manualTmr would fire later, after doStart had already set
+           lastBoundaryTs, and overwrite it based on the post-resume
+           offset — visible as a velocity blip on the first line.
+         - isManual would stay true if pause landed inside the
+           MANUAL_SCROLL_RESUME_MS window after a wheel/touch nudge,
+           blocking the loop body's integration for up to 900ms after
+           the next START.
+         - An in-flight skip animation (Tab during multi mode) would
+           keep stepping the RAF chain and writing scrollTop after pause;
+           bumping _skipAnimGen invalidates any queued step on its next
+           frame check. */
+    clearTimeout(manualTmr); manualTmr=null;
+    isManual=false;
+    _skipAnimGen++;
+    /* Bring the wordmark back and tuck the timer away — the prompter is
+       at rest again, so the bar should look the way it does on first
+       paint (no time stamp competing for attention). */
+    document.getElementById('wordmark').classList.remove('hidden');
+    document.getElementById('tmr').style.display = 'none';
+    showBar();
+    clearTimeout(barHideTimer);
+  }
+});
+
+document.getElementById('btn-cd').addEventListener('click', function(){
+  cdOn=!cdOn;
+  this.classList.toggle('on',cdOn);
+  /* Mirror aria-pressed to the on/off state so screen readers announce the
+   toggle change (the button's now a text pill, not a glyph icon, so this
+   matters more than it did when it lived as ⏱ on the bar). */
+  this.setAttribute('aria-pressed', cdOn ? 'true' : 'false');
+  save();
+});
+
+/* ═══════ KEYBOARD ═══════ */
+window.addEventListener('keydown', function(e){
+  /* Escape: close info panel first; otherwise blur the prose if it's
+     being edited. The val-input click-to-type also listens for Esc but
+     stops propagation, so this never fires while editing a value. */
+  if(e.key==='Escape'){
+    var info=document.getElementById('info-overlay');
+    if(info.classList.contains('open')){
+      closeInfoPanel(true); /* keyboard close — restore focus to #btn-info */
+      e.preventDefault();
+      return;
+    }
+    var prose=document.getElementById('prose');
+    if(document.activeElement===prose){
+      prose.blur();
+      e.preventDefault();
+      return;
+    }
+  }
+  /* When the System panel is open, keep all global hotkeys quiet so they
+     don't fight the panel's own keyboard behavior — the focus trap owns
+     Tab, focused buttons own Space/Enter, and panel inputs own arrow
+     keys. Without this guard, Tab inside the panel would also trigger
+     skipToNextSpeaker() while multiOn, Space on a focused .cpre swatch
+     would also toggle START/PAUSE, etc. Escape was already handled
+     above; nothing else should cross the boundary. */
+  if(document.getElementById('info-overlay').classList.contains('open')) return;
+  if(document.activeElement===document.getElementById('prose')) return;
+  if(document.activeElement && document.activeElement.classList.contains('val-input')) return;
+  if(e.key===' '){ e.preventDefault(); if(!cdActive) btnGo.click(); }
+  if(e.key==='ArrowUp'  ||e.key==='w'||e.key==='W'){ e.preventDefault(); nudgeWPM(+5); }
+  if(e.key==='ArrowDown'||e.key==='s'||e.key==='S'){ e.preventDefault(); nudgeWPM(-5); }
+  /* Skip-to-next-speaker is gated on cdActive so a Tab/Right press during
+     the 3-second countdown can't pre-shift the prose offset before the
+     read starts (visible as a sudden jump on countdown completion). */
+  if((e.key==='Tab'||e.key==='ArrowRight') && multiOn && !cdActive){ e.preventDefault(); skipToNextSpeaker(); }
+});
+
+/* ── Words-per-line measurement ──
+   The conversion between user-facing WPM and the engine's px/ms `speed`
+   depends on how many words actually fit on a typical line. Pre-1.0.1
+   used a fixed constant (`WORDS_PER_LINE_AVG = 6.4`) calibrated for the
+   default 36rem column at Georgia 1.75rem on desktop. That broke badly
+   in two real cases:
+     • Mobile portrait — the column is constrained by the viewport
+       (~19rem on a 390px phone), giving ~4 words/line. Engine paced
+       lines as if each carried 6.4 words, so 160 WPM displayed = ~105
+       WPM actual (35% under-pace).
+     • Monospace fonts (Courier) — fixed-width chars fit fewer words
+       per line at the same column width than proportional Georgia.
+   Fix: measure live capacity from the rendered prose box and the
+   current font, recompute every call. Canvas measureText is sub-ms,
+   only fired on user-driven recompute paths (slider/click-to-type/
+   font picker/profile/reset/resize) — never inside the RAF loop —
+   so caching adds complexity without measurable benefit. */
+function getWordsPerLine() {
+  var prose = document.getElementById('prose');
+  var cs = getComputedStyle(prose);
+  /* Reuse one canvas context; creating one per call would still be fast
+     but is wasteful. Stashed on the function itself so module-level
+     state stays clean. */
+  if (!getWordsPerLine._ctx) {
+    getWordsPerLine._ctx = document.createElement('canvas').getContext('2d');
+  }
+  var ctx = getWordsPerLine._ctx;
+  /* Canvas font shorthand: "<size> <family>". Weight/style aren't
+     varied in this app, so a minimal shorthand is sufficient. Apply
+     letterSpacing when the context supports it (Chrome 99+, Firefox
+     101+, Safari 17.2+) — without it the canvas measurement ignores
+     the .015em CSS letter-spacing on #prose and overestimates words
+     per line by ~4%, causing a small but systematic under-pace. */
+  ctx.font = cs.fontSize + ' ' + cs.fontFamily;
+  if ('letterSpacing' in ctx) { ctx.letterSpacing = cs.letterSpacing; }
+  /* Sample chosen for English letter-frequency parity. 9 words, every
+     letter at least once, mix of short and long words — reads as a
+     fair average for typical script vocabulary. */
+  var sample = 'The quick brown fox jumps over the lazy dog ';
+  var avgWordPx = ctx.measureText(sample).width / 9;
+  var colWidth = prose.clientWidth
+                 - parseFloat(cs.paddingLeft)
+                 - parseFloat(cs.paddingRight);
+  /* Fallback to the historical desktop constant when prose hasn't laid
+     out yet (very early load) or the measurement is otherwise invalid.
+     The fallback only fires for a frame at most. */
+  if (!isFinite(avgWordPx) || avgWordPx <= 0 || colWidth <= 0) {
+    return WORDS_PER_LINE_AVG;
+  }
+  return Math.max(1, colWidth / avgWordPx);
+}
+
+/* ── WPM ↔ speed conversion ──
+   Engine math drives off `speed` (px/ms calibration unit). User-facing
+   value is `wpm`. Conversion uses the current font-size, line-height,
+   AND measured words-per-line (which varies by viewport width and font)
+   so the displayed WPM matches the actual reading rate on every device
+   and every font.
+   Formula: WPM = words_per_line × 21.6 × speed / (fs × lh)
+   Inverse: speed = wpm × (fs × lh) / (words_per_line × 21.6) */
+function _wpmConstant(){
+  var fs = parseFloat(document.getElementById('fnt-sl').value) || 1.75;
+  var lh = parseFloat(document.getElementById('lh-sl').value)  || 3.0;
+  return getWordsPerLine() * 21.6 / (fs * lh);
+}
+function speedToWPM(s){ return s * _wpmConstant(); }
+function wpmToSpeed(w){ return w / _wpmConstant(); }
+
+/* Sets the user-facing WPM, recomputes the engine speed from the current
+   font/line so the engine and the displayed value stay coherent, and
+   syncs the slider + value display. Clamps WPM to a sane range. */
+function setWPM(w){
+  w = Math.round(Math.max(40, Math.min(500, parseFloat(w) || 160)));
+  wpm = w;
+  speed = wpmToSpeed(wpm);
+  document.getElementById('spd-sl').value = Math.min(wpm, 300); /* slider pegs at 300 visually but typed values run free */
+  var spdV = document.getElementById('spd-v');
+  if (spdV) spdV.textContent = String(wpm);
+}
+
+/* Called when font-size or line-height changes — recompute the engine
+   speed so WPM stays the constant the user set. */
+function recomputeSpeedFromWPM(){
+  speed = wpmToSpeed(wpm);
+}
+
+function nudgeWPM(d){
+  setWPM(wpm + d);
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+}
+
+/* Skip to the next speaker label below the current reading line.
+   Bound to Tab and ArrowRight when Multi mode is on. The motion is
+   cubic-ease-out animated rather than an instant jump — a hard snap
+   feels jarring during a read, and the ease lets the eye track where
+   the prompt is going. */
+var _skipAnimGen = 0; /* generation counter — older animations cancel themselves when a newer skip starts */
+function skipToNextSpeaker() {
+  if (_layoutDirty) refreshLayout();
+  var scrollEl = document.getElementById('scroll');
+  var labels = document.querySelectorAll('#prose .sp-label');
+  if (!labels.length) return;
+  /* Reading line = READING_ANCHOR (default 33%) down from top of scroll.
+     Use rect.height (rendered, post-transition value) rather than
+     clientHeight: while the bar is sliding away on START, #scroll's
+     CSS-driven `bottom` value is interpolating, so clientHeight reflects
+     a mid-transition height. rect.height tracks the actual painted box
+     so a Tab-skip fired 0.1s after START lands exactly on the cue line
+     instead of 5–10px low. */
+  var scrollRect = scrollEl.getBoundingClientRect();
+  var scrollTop = scrollRect.top;
+  var scrollH   = scrollRect.height;
+  var readingY  = scrollTop + scrollH * READING_ANCHOR;
+  /* Find the first label whose top is meaningfully past the reading line.
+     Tolerance = ¼ line height — avoids re-landing on the label already
+     sitting at the reading line, scales with font size and line height. */
+  var tolerance = lineHeightPx * 0.25;
+  var target = null;
+  for (var i = 0; i < labels.length; i++) {
+    if (labels[i].getBoundingClientRect().top > readingY + tolerance) {
+      target = labels[i];
+      break;
+    }
+  }
+  if (!target) return;
+  /* Convert the label's screen position to a content offset, then subtract
+     the anchor offset so it arrives exactly at the reading line. Reuses
+     scrollH from the rect above so the math stays consistent across
+     mid-transition frames. */
+  var labelTop = target.getBoundingClientRect().top;
+  var rawNew = (labelTop - scrollTop) + offset - scrollH * READING_ANCHOR;
+  var newOffset = Math.max(0, Math.min(rawNew, _maxOffset));
+  var startOffset = offset;
+  var distance = newOffset - startOffset;
+  if (distance === 0) return;
+
+  /* Reduced-motion users get the old instant jump (the ease IS extra motion). */
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    offset = newOffset;
+    scrollEl.scrollTop = offset;
+    /* Backdate boundary so the velocity curve picks up at the correct
+       sub-line phase. Setting lastBoundaryTs = now would restart the
+       curve at t=0 (slow ease-in) regardless of where in the line the
+       new offset actually sits. Same formula as the wheel/touch resume
+       handlers — keeps eye-tracking and engine pace coherent across
+       all manual-position changes. */
+    if (lineHeightPx > 0 && speed > 0) {
+      var fracR = (offset % lineHeightPx) / lineHeightPx;
+      var lineDurR = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+      lastBoundaryTs = performance.now() - fracR * lineDurR;
+    } else {
+      lastBoundaryTs = performance.now();
+    }
+    return;
+  }
+
+  /* Duration scales gently with distance so a one-line skip feels snappy
+     (~220ms) and a multi-paragraph skip stays trackable (capped at 420ms).
+     Cubic ease-out: starts moving immediately, decelerates into the new
+     line — the same shape eyes naturally expect when "landing" somewhere. */
+  var duration = Math.max(220, Math.min(420, Math.abs(distance) * 0.6));
+  var startTs = performance.now();
+  var myGen = ++_skipAnimGen;
+
+  /* Suspend the auto-scroll integrator during the animation so the loop's
+     velocity contribution doesn't fight the eased value. clearTimeout the
+     manual-resume timer too — a previous wheel/touch nudge could otherwise
+     fire mid-animation and reset isManual. */
+  isManual = true;
+  clearTimeout(manualTmr);
+
+  function step(now) {
+    /* Newer skip canceled this run — bail without finalizing. */
+    if (myGen !== _skipAnimGen) return;
+    var t = Math.min(1, (now - startTs) / duration);
+    var eased = 1 - Math.pow(1 - t, 3); /* cubic ease-out */
+    offset = startOffset + distance * eased;
+    scrollEl.scrollTop = offset;
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      /* Land exactly on target, then hand back to the loop fresh: lastTs
+         null so dt resets without a lurch, lastBoundaryTs backdated so
+         the acceleration curve picks up at the correct sub-line phase
+         instead of restarting the ease-in. Without the backdate, every
+         skip produced a one-line velocity lurch — curve at t=0 (slow
+         ease-in) even though the eye is mid-line. Same formula as the
+         wheel/touch resume handlers. */
+      offset = newOffset;
+      scrollEl.scrollTop = offset;
+      isManual = false;
+      lastTs = null;
+      if (lineHeightPx > 0 && speed > 0) {
+        var frac = (offset % lineHeightPx) / lineHeightPx;
+        var lineDuration = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+        lastBoundaryTs = performance.now() - frac * lineDuration;
+      } else {
+        lastBoundaryTs = performance.now();
+      }
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+/* ═══════ WHEEL ═══════ */
+document.getElementById('scroll').addEventListener('wheel', function(e){
+  e.preventDefault();
+  wakeBar();
+  if (_layoutDirty) refreshLayout();
+  var max = _maxOffset;
+  offset = offset + e.deltaY*0.6;
+  if (offset < 0) offset = 0;
+  if (offset > max) offset = max;
+  document.getElementById('scroll').scrollTop = offset;
+  if(running){
+    isManual=true; clearTimeout(manualTmr);
+    manualTmr=setTimeout(function(){
+      isManual=false; lastTs=null;
+      /* Resync boundary to current position. Backdate the boundary
+         timestamp so the curve picks up at the correct sub-line phase
+         instead of restarting the ease-in. */
+      if (lineHeightPx > 0) {
+        var frac = (offset % lineHeightPx) / lineHeightPx;
+        var lineDuration = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+        lastBoundaryTs = performance.now() - frac * lineDuration;
+      } else {
+        lastBoundaryTs = null;
+      }
+    },MANUAL_SCROLL_RESUME_MS);
+  }
+},{ passive:false });
+
+/* ═══════ TOUCH SCROLL ═══════ */
+/* Drives offset from touch gestures on #scroll the same way the wheel
+   handler does — including the 900ms manual-resume backdating logic. */
+var lastTouchY = null;
+document.getElementById('scroll').addEventListener('touchstart', function(e){
+  /* Re-sync offset from the element's actual scrollTop before each gesture.
+     The browser can move scrollTop independently — most commonly to follow
+     the contenteditable caret after a paste — leaving our offset variable
+     stale. Reading it here ensures the first touchmove starts from the
+     real position rather than snapping to wherever offset last was. */
+  offset = this.scrollTop;
+  lastTouchY = e.touches[0].clientY;
+}, { passive: true });
+
+document.getElementById('scroll').addEventListener('touchmove', function(e){
+  if (lastTouchY === null) return;
+  e.preventDefault();
+  var deltaY = lastTouchY - e.touches[0].clientY;
+  lastTouchY = e.touches[0].clientY;
+  wakeBar();
+  if (_layoutDirty) refreshLayout();
+  var max = _maxOffset;
+  offset = offset + deltaY;
+  if (offset < 0) offset = 0;
+  if (offset > max) offset = max;
+  document.getElementById('scroll').scrollTop = offset;
+  if (running) {
+    isManual = true; clearTimeout(manualTmr);
+    manualTmr = setTimeout(function(){
+      isManual = false; lastTs = null;
+      if (lineHeightPx > 0) {
+        var frac = (offset % lineHeightPx) / lineHeightPx;
+        var lineDuration = lineHeightPx / (speed * SPEED_PX_PER_MS_UNIT);
+        lastBoundaryTs = performance.now() - frac * lineDuration;
+      } else {
+        lastBoundaryTs = null;
+      }
+    }, MANUAL_SCROLL_RESUME_MS);
+  }
+}, { passive: false });
+
+document.getElementById('scroll').addEventListener('touchend', function(){
+  lastTouchY = null;
+}, { passive: true });
+
+/* ═══════ CLICK-TO-TYPE ═══════ */
+/* fmt(v) renders the canonical display string for the field — keeps
+   precision consistent with the slider input listener and reset, so the
+   number doesn't visually jump after editing (e.g. fnt-v: 1.75 → 1.8). */
+function makeEditable(spanId, getVal, setVal, min, max, fmt) {
+  fmt = fmt || function(v){ return v.toFixed(1); };
+  function attach() {
+    var span=document.getElementById(spanId);
+    if(!span) return;
+    span.addEventListener('click', function onClick(){
+      span.removeEventListener('click',onClick);
+      var inp=document.createElement('input');
+      inp.type='text'; inp.className='val-input';
+      inp.value=fmt(getVal());
+      span.replaceWith(inp); inp.focus(); inp.select();
+      function commit(){
+        var v=parseFloat(inp.value);
+        if(!isNaN(v)) setVal(Math.max(min,Math.min(max,v)));
+        var ns=document.createElement('span');
+        ns.id=spanId; ns.className='val';
+        ns.textContent=fmt(getVal());
+        inp.replaceWith(ns); attach();
+        /* Click-to-type changes a profile-relevant field (WPM, font size,
+           or line height); refresh the picker so it switches to Custom (or
+           to a matching named profile) the moment the value diverges. */
+        if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+        save();
+      }
+      inp.addEventListener('blur',commit);
+      inp.addEventListener('keydown',function(e){
+        if(e.key==='Enter'){ e.preventDefault(); inp.blur(); }
+        if(e.key==='Escape'){ e.stopPropagation(); inp.value=fmt(getVal()); inp.blur(); }
+      });
+    });
+  }
+  attach();
+}
+
+/* WPM display — whole numbers always (the underlying speed is a float;
+   we just round the display value). */
+function fmtWPM(v){ return String(Math.round(v)); }
+
+makeEditable('spd-v',
+  function(){ return wpm; },
+  function(v){ setWPM(v); },
+  /* Click-to-type accepts down to 40 WPM (very slow speaker) and up to
+     500 WPM (scrub past sections). Slider visually pegs at 300; typed
+     values can exceed it. */
+  40, 500,
+  fmtWPM
+);
+makeEditable('fnt-v',
+  function(){ return parseFloat(document.getElementById('fnt-sl').value); },
+  function(v){
+    setFontSize(v);
+    /* WPM-preservation invariant (spec §1d): when font-size changes via any
+       path — slider input, click-to-type, font picker, profile, reset —
+       the engine's `speed` must be recomputed from `wpm` so the perceived
+       read pace stays at the WPM the user set. The slider input handler
+       calls recomputeSpeedFromWPM(); the click-to-type commit must too. */
+    recomputeSpeedFromWPM();
+  },
+  1, 5,
+  function(v){ return v.toFixed(2); }
+);
+makeEditable('lh-v',
+  function(){ return parseFloat(document.getElementById('lh-sl').value); },
+  function(v){
+    v=Math.round(v*10)/10;
+    document.getElementById('prose').style.lineHeight=v;
+    document.getElementById('lh-sl').value=v;
+    computeLineHeight();
+    invalidateLayout();
+    /* Same WPM-preservation invariant as fnt-v above. */
+    recomputeSpeedFromWPM();
+    /* band/left height tracks lineHeightPx */
+    if(typeof applyCue==='function') applyCue();
+  },
+  2.0, 5.0,
+  function(v){ return v.toFixed(1); }
+);
+
+/* ═══════ FONT SIZE ═══════ */
+function setFontSize(fs){
+  /* NaN guard: Math.min(5, NaN) and Math.max(1, NaN) both propagate NaN,
+     which would emit `NaNrem` into the inline style and silently break
+     the prose layout. Default to 1.75rem (the spec default) on bad input. */
+  if (!isFinite(fs)) fs = 1.75;
+  fs=Math.round(Math.max(1,Math.min(5,fs))*20)/20;
+  var pr=document.getElementById('prose');
+  pr.style.fontSize=fs+'rem';
+  var col=Math.round((fs/1.75)*36)+'rem';
+  pr.style.maxWidth=col;
+  /* keep cue-col mirrored to prose's column so the Left mark sits
+     in the prose's left padding regardless of font size. Both elements
+     share the same 2.5rem static padding (from CSS) and the same
+     max-width (set above), so their content edges track perfectly —
+     no padding scaling needed. */
+  var cueCol=document.getElementById('cue-col');
+  if(cueCol) cueCol.style.maxWidth=col;
+  document.getElementById('fnt-sl').value=fs;
+  /* fnt-v may be temporarily replaced with an <input> during
+     click-to-type; only update it when the span exists. */
+  var fntV=document.getElementById('fnt-v');
+  if(fntV) fntV.textContent=fs.toFixed(2);
+  computeLineHeight();
+  invalidateLayout();
+  /* band/left sizing depends on lineHeightPx, so refresh the cue too */
+  if(typeof applyCue==='function') applyCue();
+}
+
+/* ═══════ SLIDERS ═══════ */
+document.getElementById('spd-sl').addEventListener('input', function(){
+  /* Slider value IS the WPM. setWPM converts to engine speed and updates
+     the display. */
+  setWPM(parseFloat(this.value));
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+});
+document.getElementById('fnt-sl').addEventListener('input', function(){
+  /* setFontSize already calls computeLineHeight() — no need to repeat.
+     After the font changes, recompute engine `speed` from `wpm` so the
+     perceived read pace stays at the WPM the user set (a bigger font
+     would otherwise effectively slow the read at the same px/ms). */
+  setFontSize(parseFloat(this.value));
+  recomputeSpeedFromWPM();
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+});
+document.getElementById('lh-sl').addEventListener('input', function(){
+  var lh=parseFloat(this.value);
+  document.getElementById('prose').style.lineHeight=lh;
+  /* lh-v may be temporarily replaced with a val-input during click-to-type;
+     match the symmetric guard in setFontSize / setWPM / btn-reset. */
+  var lhV=document.getElementById('lh-v');
+  if(lhV) lhV.textContent=lh.toFixed(1);
+  computeLineHeight();
+  invalidateLayout();
+  /* Same WPM-preservation rationale as the font-size handler above. */
+  recomputeSpeedFromWPM();
+  /* band/left height tracks lineHeightPx */
+  if(typeof applyCue==='function') applyCue();
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+});
+/* ═══════ RESET ═══════ */
+document.getElementById('btn-reset').addEventListener('click', function(){
+  /* If a click-to-type val-input is currently focused, blur it first so
+     its commit() restores the spans we're about to write to — otherwise
+     `getElementById('spd-v')` (or 'lh-v') returns null and throws. */
+  var ae=document.activeElement;
+  if(ae&&ae.classList&&ae.classList.contains('val-input')) ae.blur();
+  setFontSize(1.75);
+  document.getElementById('prose').style.lineHeight=3.0;
+  document.getElementById('lh-sl').value=3.0;
+  var lV=document.getElementById('lh-v'); if(lV) lV.textContent='3.0';
+  computeLineHeight();
+  invalidateLayout();
+  /* WPM reset comes after font/line so wpmToSpeed reads the new defaults. */
+  setWPM(160);
+  /* Reset only restores WPM/Size/Line per spec — cue settings are
+     deliberately not reset, but the band/left dimensions need a refresh
+     because lineHeightPx just changed. */
+  if(typeof applyCue==='function') applyCue();
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+});
+
+/* Debounce prose saves: every keystroke would otherwise trigger a sync
+   localStorage.setItem of the entire script — palpable jank on long
+   scripts. 250ms trailing edge keeps the editor responsive while still
+   feeling instant to the user. Other settings save immediately. */
+var _proseSaveTimer=null;
+function saveProseSoon(){
+  clearTimeout(_proseSaveTimer);
+  /* Null the handle inside the callback so `_proseSaveTimer` accurately
+     reflects "a save is pending in the debounce window". The resilience
+     code (flushPendingSave, beforeunload) checks this — if we left the
+     stale handle, beforeunload would prompt on every page close, not just
+     when there's an actual pending save. */
+  _proseSaveTimer=setTimeout(function(){
+    _proseSaveTimer=null;
+    save();
+  },250);
+}
+document.getElementById('prose').addEventListener('input', function(){
+  /* Skip synthetic input events fired by normalizeProse() DOM rebuild. */
+  if (_normalizing) return;
+  /* Text edits change scrollHeight → invalidate the layout cache. */
+  invalidateLayout();
+  saveProseSoon();
+});
+/* Paste handler — force plain text; strip all inline styles and rich
+   formatting from the clipboard before inserting. This is the primary
+   guard against "tiny text" caused by pasted content carrying font-size
+   or color overrides from external sources (Google Docs, web pages, etc).
+   Uses the modern Selection/Range API; falls back to the deprecated
+   execCommand('insertText') for older browsers. */
+function _insertPlainText(text) {
+  var sel = window.getSelection();
+  if (sel && sel.rangeCount) {
+    sel.deleteFromDocument();
+    var range = sel.getRangeAt(0);
+    range.insertNode(document.createTextNode(text));
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } else {
+    /* Fallback for older browsers */
+    document.execCommand('insertText', false, text);
+  }
+}
+document.getElementById('prose').addEventListener('paste', function(e) {
+  e.preventDefault();
+  var text = (e.clipboardData || window.clipboardData).getData('text/plain') || '';
+  _insertPlainText(text);
+  invalidateLayout();
+  saveProseSoon();
+  /* After insertion the browser may auto-scroll #scroll to follow the
+     caret (even though it's overflow:hidden — iOS/Android do this).
+     Defer one tick so the browser finishes its scroll, then re-sync
+     offset so the next swipe or wheel event starts from the right place. */
+  setTimeout(function(){
+    offset = document.getElementById('scroll').scrollTop;
+  }, 0);
+});
+/* Drag-and-drop sanitization. contenteditable's default drop handler
+   accepts whatever rich content the source provides — HTML, images,
+   inline styles, the works. That bypasses every guard the paste
+   handler installs, so a single drag from Google Docs / a webpage
+   / a mail client can re-introduce the "tiny text" / colour-override
+   bug paste was hardened against. We preventDefault both dragover
+   (required for drop to fire on non-input elements) and drop, then
+   pull text/plain out of the dataTransfer and route it through the
+   same plain-text insertion path the paste handler uses. */
+document.getElementById('prose').addEventListener('dragover', function(e){
+  e.preventDefault();
+});
+document.getElementById('prose').addEventListener('drop', function(e) {
+  e.preventDefault();
+  if (!e.dataTransfer) return;
+  var text = e.dataTransfer.getData('text/plain') || '';
+  if (!text) return;
+  /* Focus prose first — the drop event doesn't auto-focus the target,
+     and execCommand('insertText') (the legacy fallback inside
+     _insertPlainText) silently fails when the contenteditable isn't
+     focused. */
+  var prose = document.getElementById('prose');
+  prose.focus();
+  /* Position the caret at the drop point so the inserted text lands
+     where the user dropped, not wherever they last clicked. Without
+     this, a drag-and-drop in the middle of an existing read inserts
+     at the saved caret position (often outside the prose), which is
+     confusing — the text seems to vanish.
+       • caretRangeFromPoint   — Chrome / Safari / Edge (all current versions)
+       • caretPositionFromPoint — Firefox 20+, Safari 16.4+
+     Either API can return null when the (x, y) lies outside any text
+     node — e.g. a drop landing in the prose's bottom padding. In that
+     case (and on any browser that lacks both APIs entirely), fall
+     back to placing the caret at the end of the prose so the
+     inserted text always lands somewhere predictable instead of
+     wherever the focused caret happened to be. */
+  var sel = window.getSelection();
+  var range = null;
+  if (document.caretRangeFromPoint) {
+    range = document.caretRangeFromPoint(e.clientX, e.clientY);
+  } else if (document.caretPositionFromPoint) {
+    var pos = document.caretPositionFromPoint(e.clientX, e.clientY);
+    if (pos) {
+      range = document.createRange();
+      range.setStart(pos.offsetNode, pos.offset);
+      range.collapse(true);
+    }
+  }
+  if (!range) {
+    range = document.createRange();
+    range.selectNodeContents(prose);
+    range.collapse(false); /* collapse to end */
+  }
+  if (sel) {
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  _insertPlainText(text);
+  invalidateLayout();
+  saveProseSoon();
+  setTimeout(function(){
+    offset = document.getElementById('scroll').scrollTop;
+  }, 0);
+});
+/* Trailing-edge debounce: drag-resize fires events at 60–120 Hz, and
+   each handler call does a getComputedStyle(prose) + canvas measureText
+   (via getWordsPerLine inside _wpmConstant). Sub-ms each, but coalescing
+   keeps low-end mobile rotations and slow CPUs from spending double-digit
+   percent of the resize on style recalcs we don't render between. 50ms
+   trailing edge is below the user's perceptual threshold while still
+   collapsing a typical drag-resize burst to a single recompute. */
+var _resizeTimer = null;
+window.addEventListener('resize', function(){
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(function(){
+    _resizeTimer = null;
+    computeLineHeight();
+    invalidateLayout();
+    /* Viewport size affects rendered column width, which affects measured
+       words/line, which affects the WPM↔speed conversion. Recompute so a
+       phone rotation or window resize keeps the engine pace in sync with
+       the displayed WPM (otherwise a 160 WPM read silently becomes 105 WPM
+       when the user rotates to portrait, etc.). */
+    recomputeSpeedFromWPM();
+  }, 50);
+});
+
+/* ═══════ INFO PANEL ═══════ */
+/* Focus trap helpers — keep keyboard focus inside #info-panel while open.
+   Selector covers every interactive element type the panel uses. */
+var _trapHandler = null;
+function getFocusable(){
+  return Array.prototype.slice.call(
+    document.getElementById('info-panel').querySelectorAll(
+      'button:not([disabled]),input:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])'
+    )
+  ).filter(function(el){ return el.offsetParent !== null; }); /* skip hidden tabs */
+}
+function openInfoPanel(){
+  document.getElementById('info-overlay').classList.add('open');
+  var focusable = getFocusable();
+  if(focusable.length) focusable[0].focus();
+  /* Defensive: detach any prior trap before registering a fresh one.
+     The Multi-button auto-open path can theoretically call openInfoPanel
+     while the panel is already open (e.g. user has Settings open, types
+     into the prose, then triggers Multi via a programmatic click). Without
+     remove-before-add, we'd leak a duplicate keydown listener every time
+     and closeInfoPanel would only remove the most recent. */
+  var panel = document.getElementById('info-panel');
+  if (_trapHandler) {
+    panel.removeEventListener('keydown', _trapHandler);
+  }
+  _trapHandler = function(e){
+    if(e.key !== 'Tab') return;
+    var focusable = getFocusable();
+    if(!focusable.length) return;
+    var first = focusable[0], last = focusable[focusable.length-1];
+    if(e.shiftKey){
+      if(document.activeElement === first){ e.preventDefault(); last.focus(); }
+    } else {
+      if(document.activeElement === last){ e.preventDefault(); first.focus(); }
+    }
+  };
+  panel.addEventListener('keydown', _trapHandler);
+}
+function closeInfoPanel(viaKeyboard){
+  document.getElementById('info-overlay').classList.remove('open');
+  if(_trapHandler){
+    document.getElementById('info-panel').removeEventListener('keydown', _trapHandler);
+    _trapHandler = null;
+  }
+  /* Focus restoration is conditional on input modality. Calling .focus()
+     unconditionally lights up :focus-visible on #btn-info whenever the
+     close was keyboard-driven (Esc), which read as the System button
+     "randomly" glowing to anyone who mixes mouse and keyboard. Mouse
+     closes (✕ click, overlay click) shouldn't pull focus back to the
+     bar — there's no keyboard task to continue. Keyboard closes still
+     restore focus so screen-reader / keyboard-only users have a sane
+     landing point.
+     For mouse closes we still blur whatever's inside the panel (otherwise
+     focus would linger on a now-hidden control). */
+  if (viaKeyboard) {
+    document.getElementById('btn-info').focus();
+  } else {
+    var ae = document.activeElement;
+    if (ae && ae !== document.body && typeof ae.blur === 'function') ae.blur();
+  }
+}
+
+document.getElementById('btn-info').addEventListener('click', function(e){
+  e.stopPropagation();
+  openInfoPanel();
+});
+document.getElementById('btn-close-info').addEventListener('click', function(){
+  closeInfoPanel();
+});
+document.getElementById('info-overlay').addEventListener('click', function(e){
+  if(e.target===this) closeInfoPanel();
+});
+
+document.querySelectorAll('.itab').forEach(function(tab){
+  tab.addEventListener('click', function(){
+    document.querySelectorAll('.itab').forEach(function(t){ t.classList.remove('on'); });
+    document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('on'); });
+    tab.classList.add('on');
+    document.getElementById('tab-'+tab.dataset.tab).classList.add('on');
+  });
+});
+
+/* ═══════ FONT PICKER ═══════ */
+document.querySelectorAll('.fpick').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    document.querySelectorAll('.fpick').forEach(function(b){ b.classList.remove('on'); });
+    btn.classList.add('on');
+    currentFont=btn.dataset.font;
+    document.getElementById('prose').style.fontFamily=currentFont;
+    computeLineHeight(); invalidateLayout();
+    /* Font family affects measured words/line — Courier (monospace) fits
+       fewer words per line than Georgia at the same column width — so the
+       engine speed needs a recompute to keep the displayed WPM honest
+       across font switches. */
+    recomputeSpeedFromWPM();
+    if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+    save();
+  });
+});
+
+/* ═══════ COLORS ═══════ */
+function hexToRgb(hex){
+  hex=hex.replace(/^#/,'');
+  if(hex.length===3) hex=hex.split('').map(function(c){return c+c;}).join('');
+  var n=parseInt(hex,16);
+  return [(n>>16)&255,(n>>8)&255,n&255];
+}
+/* Robust color → [r,g,b] extractor used for luminance derivation in
+   applyColors and the bg input handler. Both flow paths are reachable
+   with rgba(...) values: parseColor preserves alpha and emits an rgba
+   string when the user types one into the BG input, and that value is
+   then persisted in tp_bg and re-applied on the next load — passing
+   rgba through hexToRgb returned [0,0,0] (parseInt(NaN) → 0), which
+   pinned the effective theme to dark whenever a translucent BG was in
+   use. Accepts 3/6/8-digit hex and rgb()/rgba(); falls back to the
+   caller's safe default on any other input. */
+function colorToRgb(c, fallback){
+  if(typeof c !== 'string') return fallback;
+  var s = c.trim();
+  var h = s.replace(/^#/, '');
+  if(/^[0-9a-fA-F]{3}$/.test(h)){
+    h = h.split('').map(function(x){return x+x;}).join('');
+  }
+  if(/^[0-9a-fA-F]{6}$/.test(h) || /^[0-9a-fA-F]{8}$/.test(h)){
+    var n = parseInt(h.slice(0,6), 16);
+    return [(n>>16)&255, (n>>8)&255, n&255];
+  }
+  var m = s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if(m) return [+m[1], +m[2], +m[3]];
+  return fallback;
+}
+/* Strict CSS color validator. Used as defense-in-depth before
+   interpolating colors into <style> rule strings, CSS variables,
+   and inline `style.cssText` — sinks where the color value is
+   embedded in raw text rather than going through a property
+   setter. The setters validate themselves; cssText / setProperty
+   / textContent of <style> do not, so a storage-poisoned
+   `tp_cue_color` or `tp_dialogue[*].color` could otherwise inject
+   arbitrary CSS (`red; }body{display:none}` etc.). Accepts the
+   shapes our code actually emits — 3/6/8-digit hex and rgb()/
+   rgba() — and falls back to the caller's safe default on any
+   other input. Anything more lenient (HSL, named colors, modern
+   color() syntax) would re-open the injection surface. */
+function _safeCssColor(c, fallback){
+  if(typeof c !== 'string') return fallback;
+  var s = c.trim();
+  if(/^#[0-9a-fA-F]{3}$/.test(s)) return s;
+  if(/^#[0-9a-fA-F]{6}$/.test(s)) return s;
+  if(/^#[0-9a-fA-F]{8}$/.test(s)) return s;
+  if(/^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$/.test(s)) return s;
+  if(/^rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*[\d.]+\s*\)$/.test(s)) return s;
+  return fallback;
+}
+function rgbToHex(r,g,b){
+  return '#'+[r,g,b].map(function(v){return('0'+Math.round(+v).toString(16)).slice(-2);}).join('');
+}
+function parseColor(s){
+  s=s.trim();
+  var h=s.replace('#','').toLowerCase();
+  if(/^[0-9a-f]{3}$/.test(h)) h=h.split('').map(function(c){return c+c;}).join('');
+  /* 8-digit hex (#RRGGBBAA): preserve alpha by emitting an rgba(...) string —
+     the cue input round-trips translucent presets through hex form, so we
+     have to reconstitute the alpha channel on read. */
+  if(/^[0-9a-f]{8}$/.test(h)){
+    var rA=parseInt(h.slice(0,2),16);
+    var gA=parseInt(h.slice(2,4),16);
+    var bA=parseInt(h.slice(4,6),16);
+    var aA=parseInt(h.slice(6,8),16)/255;
+    return 'rgba('+rA+','+gA+','+bA+','+(Math.round(aA*1000)/1000)+')';
+  }
+  if(/^[0-9a-f]{6}$/.test(h)) return '#'+h;
+  /* rgba(r,g,b,a) — preserve the alpha channel verbatim */
+  var ma=s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)$/i);
+  if(ma) return 'rgba('+(+ma[1])+','+(+ma[2])+','+(+ma[3])+','+parseFloat(ma[4])+')';
+  var m=s.match(/(\d+)[,\s]+(\d+)[,\s]+(\d+)/);
+  if(m) return rgbToHex(m[1],m[2],m[3]);
+  return null;
+}
+function syncColorInput(t,val){
+  var mode=t==='fg'?fgMode:t==='bg'?bgMode:cueMode;
+  var inp=document.getElementById(t+'-in');
+  /* For 'cue', val may be an rgba(...) preset string with alpha. Convert
+     to 8-digit hex (#RRGGBBAA) when mode is HEX so the user actually
+     sees a hex value (the previous version dumped the rgba string verbatim
+     even with the HEX tab on, which read as a UI bug). RGB mode shows
+     the canonical "r, g, b, a" triple/quadruple. */
+  var rgbaM=val.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/i);
+  if(rgbaM){
+    var rC=+rgbaM[1], gC=+rgbaM[2], bC=+rgbaM[3];
+    var aC=rgbaM[4]!==undefined?parseFloat(rgbaM[4]):1;
+    if(mode==='hex'){
+      var hexC=rgbToHex(rC,gC,bC);
+      if(aC<1){
+        var aHex=('0'+Math.round(aC*255).toString(16)).slice(-2);
+        hexC+=aHex;
+      }
+      inp.value=hexC;
+    } else {
+      inp.value = aC<1
+        ? rC+', '+gC+', '+bC+', '+aC
+        : rC+', '+gC+', '+bC;
+    }
+    return;
+  }
+  if(mode==='hex'){ inp.value=val; }
+  else{ var r=hexToRgb(val); inp.value=r[0]+', '+r[1]+', '+r[2]; }
+}
+function applyColors(fg,bg){
+  fgColor=fg; bgColor=bg;
+  document.getElementById('prose').style.color=fg;
+  var sc=document.getElementById('scroll');
+  sc.style.background=bg; document.body.style.background=bg;
+  document.getElementById('fg-sw').style.background=fg;
+  document.getElementById('bg-sw').style.background=bg;
+  syncColorInput('fg',fg); syncColorInput('bg',bg);
+  /* `.cpre` is reused for cue preset swatches (which carry data-cp,
+     not data-fg/data-bg) — filter those out so we only toggle the
+     fg/bg combo presets. */
+  document.querySelectorAll('.cpre').forEach(function(p){
+    if(p.dataset.cp) return;
+    p.classList.toggle('on', p.dataset.fg===fg && p.dataset.bg===bg);
+  });
+  /* Derive the effective theme from bg luminance so the bar and chrome
+     adapt to match the reading area (full override, not just the canvas).
+     colorToRgb (not hexToRgb) so an rgba(...) bg — reachable via the
+     RGB tab in the BG color input and via a saved tp_bg that contains
+     a translucent value — produces a real luminance instead of [0,0,0]. */
+  var rgb=colorToRgb(bg, [17,17,17]);
+  var lum=(0.299*rgb[0]+0.587*rgb[1]+0.114*rgb[2])/255;
+  document.documentElement.dataset.theme = lum<0.4 ? 'dark' : 'light';
+  /* Mark that a custom color scheme is active and show the override note. */
+  customColorsActive=true;
+  var note=document.getElementById('color-override-note');
+  if(note) note.style.display='';
+  /* Auto-pair cue to the effective theme (syncCueToTheme reads data-theme,
+     so it must be called after the luminance derivation above). */
+  syncCueToTheme();
+  if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  save();
+}
+document.querySelectorAll('.cpre').forEach(function(p){
+  /* Skip cue preset swatches — they have their own click handler below */
+  if(p.dataset.cp) return;
+  p.addEventListener('click', function(){ applyColors(p.dataset.fg, p.dataset.bg); });
+});
+
+/* ── Keyboard access for .cpre swatches ──
+   .cpre and .fpick are styled as buttons but .cpre is a <div>, so
+   keyboard users can't tab to them. Promote both to focusable role=button
+   and map Enter/Space → click. stopPropagation prevents the global
+   keydown handler from also firing — without it, Space on a focused
+   swatch would both activate the swatch *and* toggle START/PAUSE. */
+document.querySelectorAll('.cpre').forEach(function(p){
+  p.setAttribute('tabindex','0');
+  p.setAttribute('role','button');
+  p.addEventListener('keydown', function(e){
+    if(e.key==='Enter'||e.key===' '){
+      e.preventDefault();
+      e.stopPropagation();
+      p.click();
+    }
+  });
+});
+['fg','bg','cue'].forEach(function(t){
+  var inp=document.getElementById(t+'-in');
+  var tabs=document.getElementById(t+'-tabs');
+  inp.addEventListener('input', function(){
+    var c=parseColor(this.value); if(!c) return;
+    document.getElementById(t+'-sw').style.background=c;
+    if(t==='fg'){ fgColor=c; document.getElementById('prose').style.color=c; }
+    else if(t==='bg'){
+      bgColor=c;
+      document.getElementById('scroll').style.background=c;
+      document.body.style.background=c;
+      /* Re-derive effective theme from new bg and sync cue. parseColor
+         (above) emits rgba(...) when the user types a translucent value,
+         so route through colorToRgb rather than hexToRgb. */
+      var rgb=colorToRgb(c, [17,17,17]);
+      var lum=(0.299*rgb[0]+0.587*rgb[1]+0.114*rgb[2])/255;
+      document.documentElement.dataset.theme=lum<0.4?'dark':'light';
+      customColorsActive=true;
+      var note=document.getElementById('color-override-note');
+      if(note) note.style.display='';
+      syncCueToTheme();
+    }
+    else { /* cue */
+      cueColor=c; cuePreset='custom'; cueColorCustomized=true;
+      document.querySelectorAll('#cue-presets .cpre').forEach(function(p){ p.classList.remove('on'); });
+      applyCue();
+    }
+    /* Only deselect fg/bg presets when fg/bg is being typed — typing in
+       the cue input must leave the active scheme preset highlighted. */
+    if(t==='fg'||t==='bg'){
+      document.querySelectorAll('.cpre').forEach(function(p){
+        if(p.dataset.cp) return;
+        p.classList.remove('on');
+      });
+    }
+    /* A typed fg/bg or cue color almost certainly diverges from the active
+       profile (custom fg/bg, or cuePreset='custom'), so refresh the picker
+       so it flips to Custom. Without this, the previously highlighted
+       profile pill stayed on even after the user typed off-profile. */
+    if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+    save();
+  });
+  tabs.querySelectorAll('button').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      tabs.querySelectorAll('button').forEach(function(b){ b.classList.remove('on'); });
+      btn.classList.add('on');
+      var mode=btn.dataset.m;
+      if(t==='fg') fgMode=mode; else if(t==='bg') bgMode=mode; else cueMode=mode;
+      syncColorInput(t, t==='fg'?fgColor:t==='bg'?bgColor:cueColor);
+    });
+  });
+});
+
+/* ═══════ CUE INDICATOR ═══════ */
+/* applyCue is the single render path — it reads the four pieces of cue
+   state (cueOn, cueStyle, cueColor, lineHeightPx) and updates the DOM.
+   Called on: state changes (toggle/style/color/preset), font + line
+   height changes (band/left dimensions follow lineHeightPx), reset,
+   and once at end of load() so saved settings are visible on first
+   paint. */
+function applyCue(){
+  var ov=document.getElementById('cue-overlay');
+  var sc=document.getElementById('scroll');
+  var line=document.getElementById('cue-line');
+  var band=document.getElementById('cue-band');
+  var left=document.getElementById('cue-left');
+  /* expose color to CSS for the three overlay styles. _safeCssColor
+     guards against a poisoned tp_cue_color (the localStorage key feeds
+     into cueColor at load time). setProperty accepts arbitrary strings
+     and downstream `var(--cue-color)` interpolation would otherwise
+     surface whatever was written. */
+  document.documentElement.style.setProperty('--cue-color', _safeCssColor(cueColor, 'rgba(255,255,255,0.20)'));
+  /* reset any previous style before applying the active one */
+  line.style.display='none';
+  band.style.display='none';
+  left.style.display='none';
+  sc.classList.remove('cue-fade');
+  if(!cueOn){ ov.style.display='none'; return; }
+  if(cueStyle==='fade'){
+    /* Fade uses a CSS mask on #scroll — overlay isn't needed. */
+    sc.classList.add('cue-fade');
+    ov.style.display='none';
+    return;
+  }
+  ov.style.display='block';
+  if(cueStyle==='line'){
+    line.style.display='block';
+  } else if(cueStyle==='band'){
+    if(lineHeightPx<=0) computeLineHeight();
+    var bh=lineHeightPx*CUE_BAND_HEIGHT_LINES;
+    band.style.height=bh+'px';
+    /* Anchor pulled from --reading-anchor so band stays centered on the
+       reading line whether the user is on broadcast (33%) or eye-rest (38%). */
+    band.style.top='calc(var(--reading-anchor) * 100% - '+(bh/2)+'px)';
+    band.style.display='block';
+  } else if(cueStyle==='left'){
+    if(lineHeightPx<=0) computeLineHeight();
+    var lh=lineHeightPx;
+    left.style.height=lh+'px';
+    left.style.top='calc(var(--reading-anchor) * 100% - '+(lh/2)+'px)';
+    left.style.display='block';
+  }
+}
+
+/* Sets both the JS variable and the CSS variable so all anchor-dependent
+   math and rendering stay in sync. Re-applies the cue so band/left
+   positions update on the next frame. */
+function setReadingAnchor(v) {
+  v = Math.max(0.1, Math.min(0.6, parseFloat(v) || 0.33));
+  READING_ANCHOR = v;
+  document.documentElement.style.setProperty('--reading-anchor', v);
+  if (typeof applyCue === 'function') applyCue();
+}
+
+/* Pick a named preset. persistCustom=false means "auto-pairing from a
+   scheme switch" — don't clobber the customized flag, since the user
+   may have intentionally locked in a color earlier (we only enter
+   here when cueColorCustomized is already false). When called from a
+   direct user click on a swatch, the click handler resets the flag
+   explicitly before calling. */
+function setCuePreset(name, persistCustom){
+  if(!CUE_PRESET_COLORS[name]) name='qtv-white';
+  cuePreset=name;
+  cueColor=CUE_PRESET_COLORS[name];
+  document.querySelectorAll('#cue-presets .cpre').forEach(function(p){
+    p.classList.toggle('on', p.dataset.cp===name);
+  });
+  document.getElementById('cue-sw').style.background=cueColor;
+  syncColorInput('cue',cueColor);
+  applyCue();
+  if(persistCustom!==false) save();
+}
+
+/* Cue on/off toggle */
+document.querySelectorAll('#cue-toggle button').forEach(function(b){
+  b.addEventListener('click', function(){
+    cueOn = (b.dataset.cue==='on');
+    document.querySelectorAll('#cue-toggle button').forEach(function(x){ x.classList.remove('on'); });
+    b.classList.add('on');
+    document.getElementById('cue-options').style.display = cueOn ? 'flex' : 'none';
+    applyCue();
+    if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+    save();
+  });
+});
+
+/* Cue style picker */
+document.querySelectorAll('#cue-style-seg button').forEach(function(b){
+  b.addEventListener('click', function(){
+    cueStyle=b.dataset.cs;
+    document.querySelectorAll('#cue-style-seg button').forEach(function(x){ x.classList.remove('on'); });
+    b.classList.add('on');
+    applyCue();
+    if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+    save();
+  });
+});
+
+/* Cue named preset swatches — clicking pins the user's intent, so we
+   set cueColorCustomized=false (so future scheme changes auto-pair),
+   but cuePreset='preset-name' means they explicitly picked it. */
+document.querySelectorAll('#cue-presets .cpre').forEach(function(p){
+  p.addEventListener('click', function(){
+    cueColorCustomized=false;
+    setCuePreset(p.dataset.cp, true);
+    if (typeof refreshProfilePicker === 'function') refreshProfilePicker();
+  });
+});
+
+/* ═══════ READING ANCHOR ═══════ */
+/* Segmented control: Broadcast (33%) vs Eye-rest (38%). */
+document.querySelectorAll('#anchor-seg button').forEach(function(b){
+  b.addEventListener('click', function(){
+    document.querySelectorAll('#anchor-seg button').forEach(function(x){ x.classList.remove('on'); });
+    b.classList.add('on');
+    setReadingAnchor(parseFloat(b.dataset.anchor));
+    refreshProfilePicker();
+    save();
+  });
+});
+
+/* ═══════ PROFILES ═══════ */
+/* Each profile is a complete one-click setup grounded in real industry
+   conventions (see spec). Clicking applies every value to existing
+   controls; the controls remain editable after, and any subsequent
+   change flips the picker to "Custom". The profile is fingerprinted
+   from the live state on every settings change so the highlight always
+   reflects truth. */
+/* WPM values are clean integers grounded in industry research (see spec).
+   At each profile's font/line, `wpmToSpeed()` derives the engine speed
+   so the displayed WPM is what the user actually reads. */
+var PROFILES = {
+  'newsroom': {
+    font:   "Arial, Helvetica, sans-serif",
+    size:   1.75, line: 3.0, wpm: 165,
+    fg:     '#f0ede6', bg: '#111111',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'qtv-white'
+  },
+  'high-contrast': {
+    font:   "Arial, Helvetica, sans-serif",
+    size:   1.75, line: 3.0, wpm: 165,
+    fg:     '#ffeb3b', bg: '#000000',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'qtv-white'
+  },
+  'voiceover': {
+    font:   "Georgia, 'Times New Roman', serif",
+    size:   2.0, line: 3.5, wpm: 140,
+    fg:     '#f0ede6', bg: '#111111',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'qtv-white'
+  },
+  'creator': {
+    font:   "Georgia, 'Times New Roman', serif",
+    size:   1.75, line: 3.0, wpm: 145,
+    fg:     '#f0ede6', bg: '#111111',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'amber'
+  },
+  'vlog': {
+    /* Phone-to-face recording: slightly faster + smaller font (closer
+       distance, more on screen at once), Verdana for screen legibility. */
+    font:   "Verdana, Geneva, sans-serif",
+    size:   1.5, line: 2.8, wpm: 155,
+    fg:     '#f0ede6', bg: '#111111',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'amber'
+  },
+  'educator': {
+    /* Classroom / lecture pace: slow explanation rhythm, generous line
+       height for absorption, larger font for distance reading, light
+       theme matches typical academic display environments, eye-rest
+       anchor (38%) gives the reader more text-above for context. */
+    font:   "Verdana, Geneva, sans-serif",
+    size:   2.0, line: 3.5, wpm: 135,
+    fg:     '#1a1814', bg: '#f5f2eb',
+    anchor: 0.38,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'autocue-red'
+  },
+  'conference': {
+    font:   "Arial, Helvetica, sans-serif",
+    size:   2.5, line: 3.0, wpm: 120,
+    fg:     '#1a1814', bg: '#f5f2eb',
+    anchor: 0.38,
+    cueOn:  false, cueStyle: 'line', cuePreset: 'qtv-white'
+  },
+  'speedread': {
+    /* Fast scrub for memorization / structure review. Was previously
+       named "rehearsal" — renamed because actors hear "rehearsal" and
+       expect slow + deliberate, the opposite of what this profile is. */
+    font:   "Georgia, 'Times New Roman', serif",
+    size:   1.5, line: 2.8, wpm: 250,
+    fg:     '#f0ede6', bg: '#111111',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'qtv-white'
+  },
+  'terminal': {
+    font:   "system-ui, sans-serif",
+    size:   1.75, line: 3.0, wpm: 165,
+    fg:     '#00dd00', bg: '#000000',
+    anchor: 0.33,
+    cueOn:  true,  cueStyle: 'line', cuePreset: 'autocue-green'
+  }
+};
+
+/* Suppresses the auto-detect "switch to Custom" logic while we're in the
+   middle of applying a profile — every setter we call would otherwise
+   re-fingerprint and (briefly) flip the picker back to Custom. */
+var _applyingProfile = false;
+
+function applyProfile(name){
+  var p = PROFILES[name];
+  if (!p) return;
+  _applyingProfile = true;
+  try {
+    /* Font family */
+    currentFont = p.font;
+    document.getElementById('prose').style.fontFamily = p.font;
+    document.querySelectorAll('.fpick').forEach(function(b){
+      b.classList.toggle('on', b.dataset.font === p.font);
+    });
+    /* Size — setFontSize handles slider + max-width + line-height + applyCue */
+    setFontSize(p.size);
+    /* Line height */
+    document.getElementById('prose').style.lineHeight = p.line;
+    document.getElementById('lh-sl').value = p.line;
+    var lhV = document.getElementById('lh-v'); if (lhV) lhV.textContent = p.line.toFixed(1);
+    /* WPM — must follow size + line so wpmToSpeed reads the new fs/lh
+       when computing the engine speed. */
+    setWPM(p.wpm);
+    /* Color scheme — applyColors derives data-theme from bg luminance and
+       sets customColorsActive=true; that's the right state for any profile
+       since it ships an explicit fg/bg pair. */
+    applyColors(p.fg, p.bg);
+    /* Reading anchor */
+    setReadingAnchor(p.anchor);
+    document.querySelectorAll('#anchor-seg button').forEach(function(b){
+      b.classList.toggle('on', Math.abs(parseFloat(b.dataset.anchor) - p.anchor) < 0.001);
+    });
+    /* Cue: on/off toggle, style, preset. Pin cueColorCustomized=false so
+       a later scheme switch can auto-pair. */
+    cueOn = p.cueOn;
+    cueStyle = p.cueStyle;
+    document.querySelectorAll('#cue-toggle button').forEach(function(b){
+      b.classList.toggle('on', (b.dataset.cue === 'on') === cueOn);
+    });
+    document.querySelectorAll('#cue-style-seg button').forEach(function(b){
+      b.classList.toggle('on', b.dataset.cs === cueStyle);
+    });
+    document.getElementById('cue-options').style.display = cueOn ? 'flex' : 'none';
+    cueColorCustomized = false;
+    setCuePreset(p.cuePreset, false);
+    computeLineHeight();
+    invalidateLayout();
+    applyCue();
+  } finally {
+    _applyingProfile = false;
+  }
+  /* Highlight the active profile button */
+  document.querySelectorAll('.ppick').forEach(function(b){
+    b.classList.toggle('on', b.dataset.profile === name);
+  });
+  save();
+}
+
+/* Compare current state to each profile; highlight the matching one or
+   fall back to "Custom". Called from every settings-change handler.
+   Slider `input` events fire at ~60 Hz during a drag, and refreshing
+   the picker on every frame iterates 9 profiles × 10 fields per call —
+   harmless on desktop but measurable on low-end Android. The exposed
+   wrapper (`refreshProfilePicker`) coalesces calls to the next animation
+   frame so a slider drag triggers exactly one match check per paint. */
+function _refreshProfilePickerNow(){
+  if (_applyingProfile || _loading) return;
+  var match = null;
+  for (var name in PROFILES) {
+    if (PROFILES.hasOwnProperty(name) && profileMatches(PROFILES[name])) { match = name; break; }
+  }
+  document.querySelectorAll('.ppick').forEach(function(b){
+    var d = b.dataset.profile;
+    b.classList.toggle('on', match ? (d === match) : (d === 'custom'));
+  });
+}
+var _profilePickerRaf = 0;
+function refreshProfilePicker(){
+  if (_profilePickerRaf) return;
+  _profilePickerRaf = requestAnimationFrame(function(){
+    _profilePickerRaf = 0;
+    _refreshProfilePickerNow();
+  });
+}
+
+function profileMatches(p){
+  var sz = parseFloat(document.getElementById('fnt-sl').value);
+  var lh = parseFloat(document.getElementById('lh-sl').value);
+  return p.font === currentFont
+      && Math.abs(p.size - sz)   < 0.01
+      && Math.abs(p.line - lh)   < 0.01
+      && Math.abs(p.wpm - wpm)   < 0.5  /* WPM is integer-rounded; tolerate sub-unit drift */
+      && p.fg === fgColor && p.bg === bgColor
+      && Math.abs(p.anchor - READING_ANCHOR) < 0.001
+      && p.cueOn === cueOn
+      && (!p.cueOn || (p.cueStyle === cueStyle && p.cuePreset === cuePreset));
+}
+
+document.querySelectorAll('.ppick').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    /* Custom is informational — clicking it doesn't apply anything (no
+       state to apply). Just leave the user where they are. */
+    if (btn.dataset.profile === 'custom') return;
+    applyProfile(btn.dataset.profile);
+  });
+});
+
+/* ═══════ DIALOGUE MODE ═══════ */
+
+/* ── Speaker label regexes ──────────────────────────────────────────────
+   Three supported formats:
+
+   1. Inline colon  — "ALEX: text"  /  "Dr Smith: text"  /  "VOICE-OVER: text"
+      Name must start with a letter, up to two words, followed by ": " + content.
+      {0,1} cap keeps "VISUAL INSERT NEEDED:" (3 words) from matching.
+
+   2. Standalone colon — "HOST:" alone on a line (text follows on next block).
+
+   3. Bracket — "[Alex] text"  /  "[DR SMITH] text"
+      Must start with a letter; up to three words inside brackets.
+
+   Unicode support: instead of `[A-Z]` and `[A-Za-z0-9]`, we use a
+   hand-rolled Unicode letter range so non-Latin scripts (Greek
+   "ΑΛΕΞ:", Cyrillic "АЛЕКС:", Arabic, Hebrew, CJK, Hangul, etc.) parse
+   the same way Latin scripts do. ES5 doesn't support the `u` flag with
+   `\p{L}`, so the range is enumerated explicitly. The casing
+   distinction (uppercase-only) is dropped because most non-Latin
+   scripts don't have a cased/uncased pair — getMatchInfo() still
+   normalises the captured name to uppercase via toUpperCase(), and
+   case-insensitive scripts pass through unchanged.
+
+   Known edge case: single Title-Case common words like "However:" match
+   format 1 — accepted, same as v1. ─────────────────────────────────── */
+var UL  = 'A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u0500-\u052F\u0590-\u05FF\u0600-\u06FF\u4E00-\u9FFF\uAC00-\uD7AF';
+var UN  = UL + '0-9';
+var WORD = '[' + UN + ']+';
+var WORD_GAP = '(?:[\\- ][' + UN + ']+)';
+
+var SPEAKER_RE        = new RegExp('^(' + WORD + WORD_GAP + '{0,1}):\\s+\\S');
+var SPEAKER_ALONE_RE  = new RegExp('^(' + WORD + WORD_GAP + '{0,1}):\\s*$');
+var SPEAKER_BRACKET_RE = new RegExp('^\\[(' + WORD + WORD_GAP + '{0,2})\\]');
+
+/* Unified match — returns {name, key, format} or null.
+   format: 'colon' | 'alone' | 'bracket' */
+function getMatchInfo(text) {
+  var m;
+  m = text.match(SPEAKER_RE);
+  if (m) return { name: m[1].trim(), key: m[1].trim().toUpperCase(), format: 'colon' };
+  m = text.match(SPEAKER_ALONE_RE);
+  if (m) return { name: m[1].trim(), key: m[1].trim().toUpperCase(), format: 'alone' };
+  m = text.match(SPEAKER_BRACKET_RE);
+  if (m) return { name: m[1].trim(), key: m[1].trim().toUpperCase(), format: 'bracket' };
+  return null;
+}
+
+/* Inject per-speaker CSS rules into a dedicated <style> element.
+   Using a stylesheet rather than inline span style attributes means the
+   colors survive contenteditable's sanitizer, which can strip style=""
+   attributes from child nodes during user input events.
+   Rules target the normalized uppercase speaker key stored in data-sp. */
+function updateSpeakerStyles() {
+  var el = document.getElementById('sp-styles');
+  if (!el) {
+    el = document.createElement('style');
+    el.id = 'sp-styles';
+    document.head.appendChild(el);
+  }
+  if (!multiOn || dialogueSpeakers.length === 0) { el.textContent = ''; return; }
+  var css = '';
+  dialogueSpeakers.forEach(function(s) {
+    /* Two layers of escape:
+       1. The data-sp key is regex-restricted at parse time (UN char class
+          allows only Unicode letters/digits/space/hyphen), so it can't
+          contain `]` or `"` from a normal flow — but escaping `"` here
+          is cheap insurance against any future widening of the regex.
+       2. The color is run through _safeCssColor before interpolation.
+          tp_dialogue is a JSON localStorage key; if storage is poisoned
+          (e.g., another script on the same origin), an unvalidated
+          color like `red; }body{display:none}` would otherwise close
+          this rule and inject arbitrary CSS. _safeCssColor falls back
+          to '#888' on anything that doesn't look like a hex/rgb color. */
+    var k = s.key.replace(/"/g, '\\"');
+    var safeColor = _safeCssColor(s.color, '#888');
+    css += '#prose .sp-label[data-sp="' + k + '"]{color:' + safeColor + ';}';
+  });
+  el.textContent = css;
+}
+
+/* Normalize flat contenteditable prose (text nodes + <br>) to <div> blocks.
+   When the user pastes via execCommand('insertText'), Chrome inserts newlines
+   as <br> tags rather than block elements. renderDialogue() needs block
+   elements to wrap speaker-label spans, so we normalize first.
+   This is a one-time reshape — subsequent Enter keystrokes create blocks
+   naturally (<div> on Chrome, <p> on Firefox), so the function becomes a
+   no-op on re-render. The block-already-exists guard below covers both
+   shapes; we never re-wrap a Firefox <p> tree into nested <div> blocks. */
+var _normalizing = false; /* guards against re-entrant input events during normalization */
+
+function normalizeProse() {
+  /* Re-entrance guard. The setting of innerHTML below can fire a
+     synthetic 'input' event before the function returns; if any future
+     handler ends up calling normalizeProse() in response, we bail. */
+  if (_normalizing) return;
+  var prose = document.getElementById('prose');
+
+  /* Walk direct children to extract logical lines. Three states are
+     legal here:
+       1. Pure flat text from paste — text node(s) ± stray <br>s.
+       2. Pure block structure from typing/Enter — <div> or <p> children.
+       3. Mixed — e.g. user pasted (text node) and pressed Enter once
+          (browser appends a sibling <div>). The pasted text node and
+          the new <div> coexist as siblings.
+     The previous bail-on-any-block check missed case (3): the orphan
+     text node holding all the speaker labels was never wrapped, and
+     parseDialogue's block iteration silently skipped it.
+     Walking children handles all three uniformly: blocks contribute
+     their innerText (split on \n to honour inner <br>s); text nodes
+     contribute nodeValue split on \n (textContent semantics so embedded
+     \n survives); <br>s contribute an empty line. */
+  var lines = [];
+  var hasFlatContent = false;
+  for (var i = 0; i < prose.childNodes.length; i++) {
+    var n = prose.childNodes[i];
+    if (n.nodeType === 1 && (n.tagName === 'DIV' || n.tagName === 'P')) {
+      var blockText = n.innerText || '';
+      blockText.split('\n').forEach(function(l) { lines.push(l); });
+    } else if (n.nodeType === 3) {
+      hasFlatContent = true;
+      n.nodeValue.split('\n').forEach(function(l) { lines.push(l); });
+    } else if (n.nodeType === 1 && n.tagName === 'BR') {
+      hasFlatContent = true;
+      lines.push('');
+    } else if (n.nodeType === 1) {
+      /* Unknown inline element (rare — paste handler strips formatting,
+         but harden against future edge cases). Treat as flat content. */
+      hasFlatContent = true;
+      (n.textContent || '').split('\n').forEach(function(l) { lines.push(l); });
+    }
+  }
+  /* Pure-block input (no text/br/inline at top level): nothing to do —
+     the existing <div>/<p> structure is already first-class for the
+     dialogue parser. Returning here also preserves Firefox's <p> blocks
+     (we only emit <div>s on rebuild). */
+  if (!hasFlatContent) return;
+  /* Empty / whitespace-only prose — nothing to do. */
+  if (lines.length === 0) return;
+  if (lines.length === 1 && !lines[0].trim()) return;
+
+  /* Rebuild as <div> blocks. Empty lines get a <br> so Chrome renders them.
+     Setting innerHTML fires a synthetic 'input' event on some browsers —
+     the _normalizing flag tells the prose input handler to skip that cycle.
+     try/finally guarantees _normalizing is cleared even if an exception
+     escapes the rebuild — without this guarantee, a thrown error inside
+     the loop would latch the flag on permanently and silently swallow
+     every subsequent prose `input` event. */
+  _normalizing = true;
+  try {
+    prose.innerHTML = '';
+    lines.forEach(function(line) {
+      var div = document.createElement('div');
+      if (line) {
+        div.textContent = line;
+      } else {
+        div.appendChild(document.createElement('br'));
+      }
+      prose.appendChild(div);
+    });
+  } finally {
+    _normalizing = false;
+  }
+  invalidateLayout();
+}
+
+/* Split any block whose text contains a speaker-label-like sequence
+   somewhere other than the very start. Handles the common case of
+   pasted scripts where multiple speaker turns share a single paragraph
+   (e.g. "...the obvious question. RHIAN: Yes. TORJE: Hmm.") — without
+   this, parseDialogue and renderDialogue only catch the FIRST speaker
+   per block and every subsequent label is silently invisible.
+   Permissive label match (same shape as SPEAKER_RE, applied globally);
+   getMatchInfo() does the strict validation later during parseDialogue. */
+function splitMidBlockLabels() {
+  var prose = document.getElementById('prose');
+  var blocks = Array.prototype.slice.call(prose.querySelectorAll('p, div'));
+  blocks.forEach(function(b) {
+    var text = b.textContent || '';
+    /* Find every speaker-label-like position. The leading
+       `(?:^|[^UN])` does the same job `\b` did in the ASCII version —
+       require either start of text or a non-letter/digit before the
+       label, so we don't match the tail of a longer word. The `\s`
+       after `:` ensures we have content following (rules out URL paths
+       like "https:" by requiring a space). Uses the same Unicode
+       letter range (UN) as the strict regexes so non-Latin scripts
+       (Greek, Cyrillic, CJK, etc.) split mid-block correctly. */
+    var labelRe = new RegExp('(?:^|[^' + UN + '])([' + UN + ']+(?:[\\- ][' + UN + ']+){0,1}):\\s', 'g');
+    var positions = [];
+    var m;
+    while ((m = labelRe.exec(text)) !== null) {
+      /* m[0] = optional prefix char + label + ':' + whitespace.
+         label start = match start + (m[0].length - m[1].length - 2). */
+      positions.push(m.index + m[0].length - m[1].length - 2);
+    }
+    /* Nothing to do: no labels, or only one label already at the start
+       of the block (existing parser will handle it). */
+    if (positions.length === 0) return;
+    if (positions.length === 1 && positions[0] === 0) return;
+    /* Build chunks. If the first label isn't at position 0 we keep the
+       leading non-speaker prose as its own block (it might be the tail
+       of the PREVIOUS speaker's line). */
+    var splits = (positions[0] === 0) ? positions : [0].concat(positions);
+    var chunks = [];
+    for (var i = 0; i < splits.length; i++) {
+      var start = splits[i];
+      var end = (i + 1 < splits.length) ? splits[i + 1] : text.length;
+      var chunk = text.slice(start, end).trim();
+      if (chunk) chunks.push(chunk);
+    }
+    if (chunks.length <= 1) return;
+    /* Replace the original block with one new <div> per chunk. */
+    var parent = b.parentNode;
+    chunks.forEach(function(c) {
+      var d = document.createElement('div');
+      d.textContent = c;
+      parent.insertBefore(d, b);
+    });
+    parent.removeChild(b);
+  });
+  invalidateLayout();
+}
+
+function parseDialogue() {
+  var prose = document.getElementById('prose');
+  var blocks = prose.querySelectorAll('p, div');
+  var seen = {};
+  /* Preserve customizations across re-parses. Before resetting the list,
+     index existing speakers by key so a re-detected speaker keeps the
+     color the user picked from the swatch. Without this, every Re-parse
+     click (and every Multi off→on toggle, and every reload-then-Multi)
+     would wipe the user's color choices and reset to the default palette.
+     The display name comes from the current parse — if the user changed
+     the casing in the script ("Dr Smith" → "DR SMITH"), the new casing
+     wins; the key is uppercase so it matches across both. */
+  var prevByKey = {};
+  dialogueSpeakers.forEach(function(s){ prevByKey[s.key] = s; });
+  dialogueSpeakers = [];
+  function processText(text) {
+    var info = getMatchInfo(text.trim());
+    if (!info) return;
+    if (!seen[info.key]) {
+      var prev = prevByKey[info.key];
+      var color = prev
+        ? prev.color
+        : DIALOGUE_PALETTE[dialogueSpeakers.length % DIALOGUE_PALETTE.length];
+      seen[info.key] = color;
+      dialogueSpeakers.push({ name: info.name, key: info.key, color: color });
+    }
+  }
+  if (blocks.length === 0) {
+    /* Flat unstructured prose (the state right after a paste — the paste
+       handler inserts a single text node with embedded \n characters).
+       MUST use textContent, not innerText: a raw text node renders with
+       CSS whitespace collapse (white-space: normal default), so innerText
+       would collapse the \n into a space and `split('\n')` would return
+       a single entry containing every speaker on one line. Only the FIRST
+       speaker would match the regex and the rest would be silently lost.
+       textContent returns the raw source text with \n preserved. */
+    prose.textContent.split('\n').forEach(function(line){ processText(line.trim()); });
+  } else {
+    blocks.forEach(function(b){ processText(b.innerText.trim()); });
+  }
+}
+
+function renderDialogue() {
+  var prose = document.getElementById('prose');
+  var colorMap = {};
+  dialogueSpeakers.forEach(function(s){ colorMap[s.key] = true; });
+
+  /* Inject (or clear) CSS rules — colors come from the stylesheet, not
+     from inline style="" attributes, so contenteditable sanitization
+     cannot remove them during user edits. */
+  updateSpeakerStyles();
+
+  /* Ensure block elements exist before trying to wrap label spans.
+     Pasted content arrives as text + <br>; normalize to <div> blocks first. */
+  if (multiOn) normalizeProse();
+  var blocks = prose.querySelectorAll('p, div');
+
+  if (multiOn) {
+    blocks.forEach(function(b) {
+      /* If label already wrapped, keep or unwrap depending on whether the
+         speaker is still in the active set. */
+      var existing = b.querySelector('.sp-label');
+      if (existing) {
+        var key = existing.dataset.sp || '';
+        if (key && colorMap[key]) {
+          return; /* CSS rule covers the color — nothing else to do */
+        }
+        /* Speaker removed (exclusion ✕ or re-parse) — unwrap stale span. */
+        var staleText = document.createTextNode(existing.textContent);
+        existing.parentNode.replaceChild(staleText, existing);
+        /* fall through to re-check this block */
+      }
+      var text = b.innerText.trim();
+      var info = getMatchInfo(text);
+      if (!info || !colorMap[info.key]) return;
+      /* Find the first text node and wrap the label portion in a span.
+         Split character: ']' for bracket format, ':' for colon/alone.
+         Only the first text node is touched — safe for contenteditable. */
+      var walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null, false);
+      var node = walker.nextNode();
+      if (!node) return;
+      var nodeText = node.nodeValue;
+      var splitChar = (info.format === 'bracket') ? ']' : ':';
+      var labelEnd = nodeText.indexOf(splitChar);
+      if (labelEnd === -1) return;
+      var labelText = nodeText.slice(0, labelEnd + 1);
+      var restText  = nodeText.slice(labelEnd + 1);
+      var span = document.createElement('span');
+      span.className = 'sp-label';
+      span.dataset.sp = info.key;   /* normalized uppercase key — CSS selector target */
+      span.textContent = labelText;
+      var rest = document.createTextNode(restText);
+      node.parentNode.insertBefore(span, node);
+      node.parentNode.insertBefore(rest, node);
+      node.parentNode.removeChild(node);
+    });
+  } else {
+    /* Unwrap all sp-label spans — purely text substitution, no content lost */
+    prose.querySelectorAll('.sp-label').forEach(function(span) {
+      var txt = document.createTextNode(span.textContent);
+      span.parentNode.replaceChild(txt, span);
+    });
+    /* Clear the injected CSS rules — spans are gone, keep the sheet clean */
+    updateSpeakerStyles();
+  }
+  /* Wrapping/unwrapping spans changes inline layout subtly — most often
+     a no-op (label width unchanged) but we can't guarantee that across
+     every font/viewport. Invalidate the cached scrollHeight−clientHeight
+     so the next loop iteration measures fresh, rather than relying on a
+     stale `_maxOffset` from before the mutation. */
+  invalidateLayout();
+}
+
+function renderSpeakerList() {
+  var empty   = document.getElementById('dialogue-empty');
+  var list    = document.getElementById('dialogue-speakers');
+  var reparse = document.getElementById('btn-reparse');
+  if (!list) return;
+  if (dialogueSpeakers.length === 0) {
+    empty.style.display  = 'block';
+    list.style.display   = 'none';
+    if (reparse) reparse.style.display = 'none';
+    return;
+  }
+  empty.style.display  = 'none';
+  list.style.display   = 'flex';
+  if (reparse) reparse.style.display = 'inline-block';
+  list.innerHTML = '';
+  dialogueSpeakers.forEach(function(s, i) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:.625rem;';
+    /* Colour swatch — native color picker */
+    var swatch = document.createElement('input');
+    swatch.type  = 'color';
+    swatch.value = s.color;
+    swatch.style.cssText = 'width:1.75rem;height:1.75rem;border:none;border-radius:.3125rem;cursor:pointer;padding:0;background:none;flex-shrink:0;';
+    swatch.addEventListener('input', (function(speaker) {
+      /* Update color state and prose labels on every drag step, but do NOT
+         rebuild the speaker list — doing so destroys and recreates the DOM
+         mid-pick, which closes the native color picker immediately. Instead,
+         update just the name label's color in place.
+         Capture `speaker` (the object ref, not array index `i`) so a splice
+         while the picker is open can't redirect the update to the wrong entry. */
+      return function() {
+        speaker.color = swatch.value;
+        updateSpeakerStyles();
+        lbl.style.color = swatch.value;
+        save();
+      };
+    })(s));
+    swatch.addEventListener('change', function() {
+      /* Picker closed — rebuild the full list so index closures stay fresh. */
+      renderSpeakerList();
+    });
+    /* Name label. cssText is interpolated raw, so sanitise the color
+       — same defense as updateSpeakerStyles. The .style.color setter
+       elsewhere validates by itself, but cssText concatenation here
+       does not. */
+    var lbl = document.createElement('span');
+    lbl.textContent = s.name;
+    lbl.style.cssText = 'font-size:.8125rem;font-weight:700;flex:1;color:' + _safeCssColor(s.color, '#888') + ';';
+    /* ✕ exclude button — removes this speaker from the active set */
+    var xBtn = document.createElement('button');
+    xBtn.type = 'button';
+    xBtn.textContent = '✕';
+    xBtn.title = 'Exclude ' + s.name;
+    xBtn.setAttribute('aria-label', 'Exclude ' + s.name);
+    xBtn.style.cssText = 'background:none;border:none;color:var(--bar-dim);font-size:.6875rem;cursor:pointer;padding:.125rem .25rem;line-height:1;border-radius:.25rem;flex-shrink:0;';
+    xBtn.addEventListener('mouseenter', function(){ this.style.color='var(--bar-text)'; });
+    xBtn.addEventListener('mouseleave', function(){ this.style.color='var(--bar-dim)'; });
+    xBtn.addEventListener('click', function() {
+      /* renderDialogue mutates prose blocks (unwraps stale spans).
+         The Settings panel is normally only reachable while paused,
+         but the bar can be auto-hidden mid-read and the user could
+         still open Settings during the brief visible window — pause
+         (or cancel countdown) defensively so the unwrap can't run
+         under a live RAF loop. */
+      pauseOrCancel();
+      dialogueSpeakers.splice(i, 1);
+      renderDialogue();    /* unwraps stale spans for the removed speaker */
+      renderSpeakerList(); /* rebuilds the list with correct indices */
+      save();
+    });
+    row.appendChild(swatch);
+    row.appendChild(lbl);
+    row.appendChild(xBtn);
+    list.appendChild(row);
+  });
+}
+
+/* ── Multi button ──
+   v1.1: turning Multi ON runs the full detection pipeline AND opens the
+   Settings panel to the Multi-speaker tab — the user sees the detected
+   speakers immediately and can recolour or exclude false positives in one
+   gesture. Turning Multi OFF just strips colours; no panel pop-up. */
+document.getElementById('btn-multi').addEventListener('click', function() {
+  /* Mutating prose blocks while the engine is running (or while the
+     countdown is sweeping) scrambles `_maxOffset` and the in-flight
+     scroll/animation state. pauseOrCancel handles both: cancels the
+     countdown if cdActive, otherwise pauses if running. */
+  pauseOrCancel();
+  multiOn = !multiOn;
+  this.classList.toggle('on', multiOn);
+  /* Mirror aria-pressed to the on/off state so screen readers announce
+     the toggle change. Same pattern as btn-cd. */
+  this.setAttribute('aria-pressed', multiOn ? 'true' : 'false');
+  if (multiOn) {
+    /* Pipeline: ensure blocks exist (normalizeProse), then split any
+       block that contains mid-paragraph speaker labels into separate
+       blocks (splitMidBlockLabels), then detect speakers, then wrap
+       label spans. The split step is what makes "X. RHIAN: y. TORJE:
+       z" inside one paragraph resolve to two coloured speakers instead
+       of just RHIAN. */
+    normalizeProse();
+    splitMidBlockLabels();
+    parseDialogue();
+    renderDialogue();
+    renderSpeakerList();
+    /* Switch the Settings panel to the Multi-speaker tab and open it.
+       Direct class toggling (rather than synthesizing a click on the
+       tab button) avoids re-running the click handler's state setup
+       and keeps the focus trap inside openInfoPanel as the single
+       canonical entry path for the panel. */
+    document.querySelectorAll('.itab').forEach(function(t){ t.classList.remove('on'); });
+    document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('on'); });
+    var multiTab = document.querySelector('.itab[data-tab="multi"]');
+    if (multiTab) multiTab.classList.add('on');
+    var multiContent = document.getElementById('tab-multi');
+    if (multiContent) multiContent.classList.add('on');
+    openInfoPanel();
+  } else {
+    /* Strip colours and unwrap speaker spans — leaves the prose text
+       intact (renderDialogue with multiOn=false handles unwrapping).
+       Turning OFF deliberately does NOT open the panel — the user is
+       choosing to clean up the canvas, surfacing UI would fight that. */
+    renderDialogue();
+  }
+  save();
+});
+
+/* ── Compact speaker spacing ── */
+function applyCompactSpeakers() {
+  var prose = document.getElementById('prose');
+  prose.classList.toggle('compact-speakers', compactSpeakers);
+  var btn = document.getElementById('btn-compact-speakers');
+  if (btn) {
+    btn.classList.toggle('on', compactSpeakers);
+    btn.setAttribute('aria-pressed', compactSpeakers ? 'true' : 'false');
+    btn.textContent = compactSpeakers ? 'Compact: On' : 'Compact: Off';
+  }
+}
+
+document.getElementById('btn-compact-speakers').addEventListener('click', function() {
+  compactSpeakers = !compactSpeakers;
+  applyCompactSpeakers();
+  save();
+});
+
+/* ── Re-parse button ── */
+document.getElementById('btn-reparse').addEventListener('click', function() {
+  /* pauseOrCancel handles both running playback and an in-flight
+     countdown — the pipeline below restructures DOM blocks, and either
+     state would scramble offset / _maxOffset bookkeeping. */
+  pauseOrCancel();
+  /* Same pipeline as the Multi turn-on path — the user may have edited
+     the script and added new mid-paragraph labels since the last parse. */
+  normalizeProse();
+  splitMidBlockLabels();
+  parseDialogue();
+  renderDialogue();
+  renderSpeakerList();
+  save();
+  /* Click feedback — the work above is synchronous so without this the
+     button looks dead. Same pattern as #btn-copy-prompt. renderSpeakerList
+     above only toggles the button's display:none/inline-block based on
+     whether speakers were found; it doesn't touch textContent, so this
+     label change survives. If no speakers were detected the button is
+     now hidden — the empty-state message provides the implicit signal.
+     Always reset the label after the timeout so a subsequent re-parse
+     starts from the canonical "Re-parse script" text. */
+  var btn = this;
+  btn.textContent = 'Re-parsed!';
+  setTimeout(function(){ btn.textContent = 'Re-parse script'; }, 1500);
+});
+
+
+/* ── Copy AI prompt button ── */
+var MULTI_FORMAT_PROMPT = [
+  'Format the following script for a teleprompter multi-speaker parser. Follow these rules exactly:\n',
+  '1. Speaker labels must appear at the start of a NEW line, followed by a colon and a space.',
+  '   Use ALL-CAPS or Title Case — e.g. ALEX: or Alex:',
+  '   For two-word names: DR SMITH: or Dr Smith:',
+  '',
+  '2. NEVER put two different speakers inside the same line or the same paragraph.',
+  '   If a speaker change happens mid-sentence in the source, break the sentence',
+  '   so each speaker starts on its own fresh line. Example:',
+  '     WRONG → "Yes, exactly. ALEX: And then we did the thing."',
+  '     RIGHT → "Yes, exactly."',
+  '             ""',
+  '             "ALEX: And then we did the thing."',
+  '',
+  '3. Put one blank line before every speaker label.',
+  '   Never start a new speaker line immediately after the previous speaker\'s last line.',
+  '',
+  '4. Do not change any dialogue text. Preserve every word, contraction, punctuation',
+  '   mark, and pause marker exactly as written.',
+  '',
+  '5. Leave stage directions, scene notes, or non-dialogue lines unchanged on their',
+  '   own lines, without a speaker label.',
+  '',
+  '6. If the script already has labels in a different format (e.g. [Name] or "Name:"),',
+  '   convert them to the CAPS-colon format above.',
+  '',
+  '7. Block false-positive speaker matches. THIS IS CRITICAL — the parser tags any',
+  '   match of the pattern below as a speaker turn, even mid-sentence, even when',
+  '   the surrounding prose makes the colon\'s meaning obvious to a human reader.',
+  '',
+  '   THE PATTERN TO ELIMINATE (anywhere in a paragraph, not just at line start):',
+  '       <Capitalised-word> [optional second word, ANY case] : <space> <content>',
+  '',
+  '   The second word can be lowercase, uppercase, anything. So ALL of these match',
+  '   and ALL must be rewritten:',
+  '     • "Finanstilsynet was: does this work?"     ← second word lowercase, still matches',
+  '     • "Stephen King wrote: he turned and..."    ← attribution, still matches',
+  '     • "She replied: yes."                       ← quotation, still matches',
+  '     • "Pi: the ratio of circumference..."       ← definition, still matches',
+  '     • "First: connect the cable."               ← list/section, still matches',
+  '     • "Note:", "Example:", "However:", "Tip:", "Warning:", "Step 1:", "Q:", "A:"',
+  '',
+  '   FIX: Replace the colon with an em-dash ("—"). Use closed form ("Word—content")',
+  '   inside a sentence; spaced form ("Word — content") for line-leading list items.',
+  '   Both block the parser equally because both eliminate the ":<space>" token.',
+  '',
+  '   ONLY exception: real speaker labels — a character name followed by their',
+  '   dialogue. Those are precisely what the parser is built to detect; leave them.',
+  '',
+  '   Examples:',
+  '     WRONG → "The question we put to Finanstilsynet was: does this work?"',
+  '     RIGHT → "The question we put to Finanstilsynet was—does this work?"',
+  '',
+  '     WRONG → "She replied: I don\'t know."',
+  '     RIGHT → "She replied—I don\'t know."',
+  '',
+  '     WRONG → "First: connect the cable."',
+  '     RIGHT → "First — connect the cable."',
+  '',
+  '   When in doubt: if the text before the colon is NOT a person\'s name being',
+  '   introduced as a new speaker, replace the colon with an em-dash.',
+  '',
+  'Paste your script below this line:',
+  '────────────────────────────────────────'
+].join('\n');
+
+document.getElementById('btn-copy-prompt').addEventListener('click', function() {
+  var btn = this;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(MULTI_FORMAT_PROMPT).then(function() {
+      btn.textContent = 'Copied!';
+      setTimeout(function(){ btn.textContent = 'Copy AI prompt'; }, 1800);
+    }).catch(function() {
+      btn.textContent = 'Failed';
+      setTimeout(function(){ btn.textContent = 'Copy AI prompt'; }, 1800);
+    });
+  } else {
+    /* Fallback for older browsers / non-HTTPS */
+    var ta = document.createElement('textarea');
+    ta.value = MULTI_FORMAT_PROMPT;
+    ta.style.cssText = 'position:fixed;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try {
+      document.execCommand('copy');
+      btn.textContent = 'Copied!';
+    } catch(e) {
+      btn.textContent = 'Failed';
+    }
+    document.body.removeChild(ta);
+    setTimeout(function(){ btn.textContent = 'Copy AI prompt'; }, 1800);
+  }
+});
+
+/* ═══════ PERSIST ═══════ */
+/* Toast shown when localStorage write fails (private mode, quota
+   exceeded, storage disabled, etc.). Debounced with a 2-second window
+   so a burst of keystroke-driven failures coalesces into one toast.
+   If saving keeps failing in later windows the toast re-surfaces, so
+   users never lose data silently after the initial signal. */
+var _saveFailTmr = null;
+function notifySaveFailure(){
+  /* Already queued — coalesce. The actual setTimeout will resolve, run
+     showSaveToast(), and clear _saveFailTmr so the next failure window
+     can open. */
+  if (_saveFailTmr) return;
+  _saveFailTmr = setTimeout(function(){
+    _saveFailTmr = null;
+    showSaveToast();
+  }, 2000);
+}
+function showSaveToast(){
+  /* Remove any existing save-toast on the page so re-surfacing doesn't
+     stack DOM nodes with duplicate ids and visual clutter. */
+  var existing = document.getElementById('save-toast');
+  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+  var t=document.createElement('div');
+  t.id='save-toast';
+  t.setAttribute('role','status');
+  t.textContent="Couldn't save — your script may not survive a reload.";
+  document.body.appendChild(t);
+  setTimeout(function(){
+    t.style.opacity='0';
+    setTimeout(function(){ if(t.parentNode) t.parentNode.removeChild(t); },500);
+  },5000);
+}
+
+function save(){
+  /* During the initial load() restoration, several setters (setTheme,
+     applyColors) call save() before cue/cd/font state has been written
+     back to globals. Bail out so we don't clobber the user's saved values
+     with init defaults. */
+  if(_loading) return;
+  try{
+    localStorage.setItem('tp_text',  document.getElementById('prose').innerText);
+    localStorage.setItem('tp_wpm',   String(wpm));
+    /* The legacy `tp_spd` key (engine `speed` value, used by older
+       versions before the WPM rename) is now removed at migration time
+       inside load() — no need to re-remove on every save. */
+    localStorage.setItem('tp_fnt',   document.getElementById('fnt-sl').value);
+    localStorage.setItem('tp_lh',    document.getElementById('lh-sl').value);
+    localStorage.setItem('tp_theme', theme);
+    localStorage.setItem('tp_cd',    cdOn?'1':'0');
+    /* Only persist custom colors when they're actually active — otherwise
+       remove the keys so load() never calls applyColors() and the override
+       note never fires incorrectly on a fresh reload. */
+    if(customColorsActive){
+      localStorage.setItem('tp_fg', fgColor);
+      localStorage.setItem('tp_bg', bgColor);
+    } else {
+      localStorage.removeItem('tp_fg');
+      localStorage.removeItem('tp_bg');
+    }
+    localStorage.setItem('tp_font',  currentFont);
+    /* Cue indicator (off by default) */
+    localStorage.setItem('tp_cue_on',           cueOn?'1':'0');
+    localStorage.setItem('tp_cue_style',        cueStyle);
+    localStorage.setItem('tp_cue_color',        cueColor);
+    localStorage.setItem('tp_cue_preset',       cuePreset);
+    localStorage.setItem('tp_cue_color_custom', cueColorCustomized?'1':'0');
+    /* Dialogue mode */
+    localStorage.setItem('tp_multi',            multiOn ? '1' : '0');
+    localStorage.setItem('tp_compact_speakers', compactSpeakers ? '1' : '0');
+    localStorage.setItem('tp_dialogue',         JSON.stringify(dialogueSpeakers));
+    /* Reading-line anchor (Broadcast 33% / Eye-rest 38%) */
+    localStorage.setItem('tp_anchor',   String(READING_ANCHOR));
+  }catch(e){ notifySaveFailure(); }
+}
+
+(function load(){
+  _loading=true;
+  try{
+    var txt=localStorage.getItem('tp_text');
+    var wpmStr=localStorage.getItem('tp_wpm');
+    var spdLegacy=localStorage.getItem('tp_spd'); /* legacy 1-15 abstract — migrated below */
+    var fnt=localStorage.getItem('tp_fnt');
+    var lh =localStorage.getItem('tp_lh');
+    var th =localStorage.getItem('tp_theme');
+    var cd =localStorage.getItem('tp_cd');
+    var fg =localStorage.getItem('tp_fg');
+    var bg =localStorage.getItem('tp_bg');
+    var fon=localStorage.getItem('tp_font');
+    var cOn = localStorage.getItem('tp_cue_on');
+    var cSt = localStorage.getItem('tp_cue_style');
+    var cCol= localStorage.getItem('tp_cue_color');
+    var cPre= localStorage.getItem('tp_cue_preset');
+    var cCus= localStorage.getItem('tp_cue_color_custom');
+    var mul = localStorage.getItem('tp_multi');
+    var cmpct = localStorage.getItem('tp_compact_speakers');
+    var dlg = localStorage.getItem('tp_dialogue');
+    var anc = localStorage.getItem('tp_anchor');
+
+    if(txt) document.getElementById('prose').innerText=txt;
+    /* Restore font FAMILY first, then size + line, THEN WPM. Order matters:
+       `getWordsPerLine()` measures the rendered prose box and font, and
+       `setWPM` calls `wpmToSpeed` which reads that measurement. If font
+       family is applied AFTER `setWPM`, the engine speed is computed
+       against the default Georgia metrics and goes stale the moment the
+       saved font (e.g. Courier monospace) is applied. Reordering keeps
+       the engine speed coherent with the displayed WPM through the entire
+       restoration. */
+    if(fon){
+      currentFont=fon;
+      document.getElementById('prose').style.fontFamily=fon;
+      document.querySelectorAll('.fpick').forEach(function(b){
+        b.classList.toggle('on', b.dataset.font===fon);
+      });
+    }
+    /* Restore line-height BEFORE font size so setFontSize's internal
+       computeLineHeight() reads the correct lh-sl value. With the
+       opposite order, lineHeightPx briefly cached against the previous
+       lh until the explicit recompute later in load() — harmless today
+       (nothing reads lineHeightPx in this window) but easy for a future
+       change to break. */
+    if(lh){
+      var l=parseFloat(lh);
+      if (!isFinite(l) || l < 2 || l > 5) l = 3.0;
+      document.getElementById('lh-sl').value=l;
+      document.getElementById('lh-v').textContent=l.toFixed(1);
+      document.getElementById('prose').style.lineHeight=l;
+    }
+    if(fnt){
+      var f = parseFloat(fnt);
+      /* setFontSize internally clamps & validates, but Math.min/max with
+         NaN propagate NaN — guard at the call site so a corrupted
+         tp_fnt can't write 'NaNrem' into the inline style. */
+      if (isFinite(f)) setFontSize(f);
+    }
+    /* WPM restoration with one-time legacy migration. If `tp_wpm` exists,
+       use it. Otherwise, if the old `tp_spd` (engine speed value, 1-15
+       range — this slider position doubled as the px/ms calibration unit
+       in older versions) is present, treat it as engine `speed` and
+       convert to WPM at the now-restored fs/lh — users updating from a
+       previous version land at the same perceived pace. The next save()
+       removes `tp_spd`. setWPM internally clamps NaN/out-of-range to a
+       sane default, so corrupted localStorage can't crash here. */
+    if (wpmStr) {
+      setWPM(parseFloat(wpmStr));
+    } else if (spdLegacy) {
+      var legacySpeed = parseFloat(spdLegacy);
+      setWPM(speedToWPM(legacySpeed));
+    } else {
+      setWPM(160); /* fresh-install default */
+    }
+    /* Drop the legacy key as soon as the migration runs. Previously the
+       removeItem fired inside the next save(); if the tab crashed before
+       the user touched any control, tp_spd would survive and re-trigger
+       the migration on the next load (idempotent today, but stale data
+       compounds risk over time). */
+    if (spdLegacy) {
+      try { localStorage.removeItem('tp_spd'); } catch(e) {}
+    }
+    /* Validate against the closed set of legal values. A poisoned
+       tp_theme of e.g. 'banana' would otherwise drift through setTheme,
+       leave the segmented control with no button highlighted, and end
+       up rendering the light fallback while the saved key claims
+       'banana' forever. */
+    if (th === 'auto' || th === 'light' || th === 'dark') setTheme(th);
+    else applyTheme('auto');
+    if(cd==='1'){
+      cdOn=true;
+      var cdBtn=document.getElementById('btn-cd');
+      cdBtn.classList.add('on');
+      cdBtn.setAttribute('aria-pressed','true');
+    }
+    /* Restore the cue-customised flag BEFORE applyColors so syncCueToTheme
+       (called inside applyColors) respects the user's pinned cue color
+       instead of auto-pairing it to the bg luminance. The previous order
+       relied on a downstream re-write to undo the auto-pair — correct,
+       but fragile: any future setter that reads cuePreset between
+       applyColors and the re-write would see the auto-paired value. */
+    if(cCus==='1') cueColorCustomized=true;
+    if(fg&&bg) applyColors(fg,bg);
+    /* Make sure lineHeightPx reflects the just-loaded settings before
+       the first frame runs (it would otherwise stay 0 until doStart). */
+    computeLineHeight();
+    /* Belt-and-braces: `setWPM` ran with whatever font/size/lh were live
+       at that moment. If any of those changed downstream during this load
+       (theme, applyColors, etc. don't touch font but defensive recompute
+       costs one float multiply), make sure `speed` reflects the final
+       state of the rendered prose before the first paint. */
+    recomputeSpeedFromWPM();
+
+    /* ── Cue restoration ──
+       cueColorCustomized was hoisted above (before applyColors) so the
+       inline syncCueToTheme inside applyColors already saw the pinned
+       state; here we restore the rest of the cue properties. Each value
+       is validated against its closed set / shape so a poisoned key
+       (other-extension or attacker-controlled localStorage on the same
+       origin) can't surface garbage in the UI or downstream CSS. */
+    if (cSt === 'line' || cSt === 'band' || cSt === 'left' || cSt === 'fade') cueStyle=cSt;
+    if (cCol) cueColor = _safeCssColor(cCol, cueColor);
+    if (cPre && CUE_PRESET_COLORS.hasOwnProperty(cPre)) cuePreset=cPre;
+    else if (cPre === 'custom') cuePreset='custom';
+    if (cOn==='1') cueOn=true;
+
+    /* Sync UI: toggle, style picker, preset highlight, swatch, custom input */
+    document.querySelectorAll('#cue-toggle button').forEach(function(b){
+      b.classList.toggle('on', (b.dataset.cue==='on')===cueOn);
+    });
+    document.querySelectorAll('#cue-style-seg button').forEach(function(b){
+      b.classList.toggle('on', b.dataset.cs===cueStyle);
+    });
+    document.querySelectorAll('#cue-presets .cpre').forEach(function(p){
+      p.classList.toggle('on', p.dataset.cp===cuePreset);
+    });
+    document.getElementById('cue-sw').style.background=cueColor;
+    syncColorInput('cue', cueColor);
+    document.getElementById('cue-options').style.display = cueOn ? 'flex' : 'none';
+    applyCue();
+
+    /* ── Dialogue restoration ── */
+    if (mul === '1') {
+      multiOn = true;
+      var multiBtnL = document.getElementById('btn-multi');
+      multiBtnL.classList.add('on');
+      multiBtnL.setAttribute('aria-pressed', 'true');
+    }
+    /* Compact speaker spacing — default true; only override if explicitly
+       saved as '0' so new installs get the compact default. */
+    if (cmpct === '0') compactSpeakers = false;
+    applyCompactSpeakers();
+    if (dlg) {
+      try {
+        var parsedDlg = JSON.parse(dlg);
+        /* Defensive: reject anything that isn't an array (JSON.parse('null')
+           returns null and would later throw at dialogueSpeakers.length),
+           and shape-check every entry. tp_dialogue ends up flowing into a
+           CSS rule (`updateSpeakerStyles`) and an inline style.cssText
+           (`renderSpeakerList`); both have downstream _safeCssColor guards
+           but normalising here means the rest of the code can trust the
+           shape without re-validating. Also caps name/key length so an
+           attacker-controlled key can't blow up the CSS file with
+           multi-megabyte selectors. */
+        if (Array.isArray(parsedDlg)) {
+          dialogueSpeakers = parsedDlg.filter(function(x){
+            return x && typeof x === 'object'
+              && typeof x.name === 'string' && x.name.length > 0 && x.name.length < 200
+              && typeof x.key  === 'string' && x.key.length  > 0 && x.key.length  < 200
+              && typeof x.color === 'string';
+          }).map(function(x){
+            return { name: x.name, key: x.key, color: _safeCssColor(x.color, '#888') };
+          });
+        }
+      } catch(e) {}
+    }
+    /* Re-render after prose is restored — only when both are truthy */
+    if (multiOn && dialogueSpeakers.length > 0) {
+      renderDialogue();
+      renderSpeakerList();
+    }
+
+    /* ── Reading anchor restoration ──
+       Default 0.33 (broadcast). Saved values clamp to [0.1, 0.6] inside
+       setReadingAnchor. After restoring, refresh the anchor segmented
+       control so the on-state reflects truth. If no button matched
+       (e.g. a corrupted tp_anchor that landed on 0.5 — within the clamp
+       range but not on either preset), fall back to highlighting the
+       default 0.33 button so the segmented control is never left with
+       both buttons in the 'off' state. */
+    if (anc) setReadingAnchor(parseFloat(anc));
+    var anchorMatched = false;
+    document.querySelectorAll('#anchor-seg button').forEach(function(b){
+      var match = Math.abs(parseFloat(b.dataset.anchor) - READING_ANCHOR) < 0.001;
+      b.classList.toggle('on', match);
+      if (match) anchorMatched = true;
+    });
+    if (!anchorMatched) {
+      var fallbackBtn = document.querySelector('#anchor-seg button[data-anchor="0.33"]');
+      if (fallbackBtn) fallbackBtn.classList.add('on');
+    }
+
+    /* Highlight the active profile (or "Custom") to reflect restored state. */
+    if (typeof refreshProfilePicker === 'function') {
+      /* Force-run even though _loading is true — at this point all state
+         is restored, and we want the picker to show the right pill on
+         first paint. Temporarily flip _loading off for the call. */
+      _loading = false;
+      refreshProfilePicker();
+      _loading = true;
+    }
+
+    /* --bar-h is initialised by the ResizeObserver registered above,
+       which fires immediately after the first layout pass. No explicit
+       sync needed here. */
+  }catch(e){
+    /* Defensive: clear _loading inside the catch as well, so a thrown
+       exception during restoration can't leave save() permanently muted.
+       (The line below is reached on the happy path; the duplicate here
+       protects against any future code added inside the catch that could
+       throw.) */
+    _loading=false;
+    applyTheme('auto');
+  }
+  _loading=false;
+  document.getElementById('version-label').textContent = 'v' + VERSION;
+  /* Snapshot recovery prompt — runs after all state is restored so we can
+     compare the loaded prose to the snapshot meaningfully. */
+  if (typeof checkSnapshotRecovery === 'function') checkSnapshotRecovery();
+})();
+
+/* ═══════ RESILIENCE ═══════
+   Six belt-and-braces guards layered on top of the primary tp_text save:
+   1. Snapshot slot (tp_text_snap) — periodic write at SNAPSHOT_INTERVAL_MS,
+      restored on next load if the primary text comes back blank.
+   2. visibilitychange flush — flushes the debounced save when the tab is
+      hidden (mobile background, tab switch).
+   3. pagehide flush — final save attempt before the page is unloaded.
+   4. beforeunload prompt — native "leave site?" dialog if a save is still
+      pending in the debounce window.
+   5. Download script — Blob → .txt download for off-device backup.
+   6. Load from file — FileReader replacement of prose contents. */
+
+/* ── 1. Snapshot slot ──
+   A second localStorage key written every SNAPSHOT_INTERVAL_MS minutes when
+   the prose has changed. Acts as a recovery slot if contenteditable corrupts
+   mid-edit and the corrupted state gets saved over the good one — the
+   snapshot from up to 5 minutes earlier is still there. */
+var SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+/* Seed _lastSnapshotText with the loaded prose so the first interval tick
+   doesn't write a redundant snapshot when the user hasn't edited. The
+   load() IIFE has already restored tp_text into #prose by this point. */
+var _lastSnapshotText = (function(){
+  try { return document.getElementById('prose').innerText || ''; }
+  catch(e) { return ''; }
+})();
+function writeSnapshot(){
+  if (_loading) return;
+  try {
+    var text = document.getElementById('prose').innerText || '';
+    if (text === _lastSnapshotText) return;
+    /* Don't snapshot tiny stubs — they'd just shadow real content if the
+       user happens to clear the script briefly. */
+    if (text.length < 50) return;
+    localStorage.setItem('tp_text_snap',    text);
+    localStorage.setItem('tp_text_snap_ts', String(Date.now()));
+    _lastSnapshotText = text;
+  } catch(e) { /* primary save toast already handles quota signals */ }
+}
+/* Stored so a future test harness or an embed scenario can clear the
+   interval cleanly. The script never clears it itself — the page lives
+   for the whole session. */
+var _snapshotInterval = setInterval(writeSnapshot, SNAPSHOT_INTERVAL_MS);
+
+/* On load: if the primary slot is empty but the snapshot has substantial
+   content, surface a non-blocking banner so the user can recover. The
+   `dismissed_ts` key matches the snapshot timestamp the user dismissed,
+   so a fresh snapshot will re-prompt on the next load if needed. */
+function checkSnapshotRecovery(){
+  try {
+    var current      = localStorage.getItem('tp_text')                 || '';
+    var snap         = localStorage.getItem('tp_text_snap')            || '';
+    var snapTs       = localStorage.getItem('tp_text_snap_ts')         || '';
+    var dismissedTs  = localStorage.getItem('tp_text_snap_dismissed_ts') || '';
+    if (current.length >= 50) return;
+    if (snap.length    < 100) return;
+    if (snapTs && snapTs === dismissedTs) return;
+    showSnapshotRecoveryBanner(snap, parseInt(snapTs || '0', 10));
+  } catch(e) {}
+}
+function _formatAgo(ms){
+  var mins = Math.max(1, Math.round(ms / 60000));
+  if (mins < 60)   return mins + ' min ago';
+  if (mins < 1440) return Math.round(mins/60) + ' hr ago';
+  return Math.round(mins/1440) + ' days ago';
+}
+function removeSnapshotBanner(){
+  var b = document.getElementById('snap-banner');
+  if (b && b.parentNode) b.parentNode.removeChild(b);
+}
+function showSnapshotRecoveryBanner(snap, ts){
+  removeSnapshotBanner();
+  var ago = ts ? _formatAgo(Date.now() - ts) : 'earlier';
+  var banner = document.createElement('div');
+  banner.id = 'snap-banner';
+  banner.setAttribute('role', 'status');
+  /* All visual styling lives in the #snap-banner CSS rule — using a
+     class instead of inline cssText guarantees CSS variables resolve
+     correctly on every browser, including older Safari versions that
+     handle var() lazily inside inline style.cssText. */
+  var msg = document.createElement('span');
+  msg.className = 'snap-msg';
+  msg.textContent = 'Snapshot from ' + ago + ' is longer than your current script.';
+  var btnRecover = document.createElement('button');
+  btnRecover.type = 'button';
+  btnRecover.className = 'snap-recover';
+  btnRecover.textContent = 'Recover';
+  btnRecover.addEventListener('click', function(){
+    try {
+      /* Recovery wipes and rebuilds prose. The banner only surfaces on
+         load when current is < 50 chars, so running is almost always
+         false here, but defensive parity with the import, Multi, Re-parse,
+         and Detect handlers keeps the rule consistent: any prose-
+         restructuring path stops playback (and any active countdown) first. */
+      pauseOrCancel();
+      /* Same rationale as the import handler: write the snapshot as a flat
+         text node so textContent reproduces newlines, then normalize to
+         <div> blocks. innerText assignment would break the multi parser. */
+      var prose = document.getElementById('prose');
+      prose.innerHTML = '';
+      prose.appendChild(document.createTextNode(snap));
+      normalizeProse();
+      invalidateLayout();
+      save();
+      if (multiOn) {
+        splitMidBlockLabels();
+        parseDialogue(); renderDialogue(); renderSpeakerList();
+      }
+    } catch(e) {}
+    removeSnapshotBanner();
+  });
+  var btnDismiss = document.createElement('button');
+  btnDismiss.type = 'button';
+  btnDismiss.className = 'snap-dismiss';
+  btnDismiss.textContent = 'Dismiss';
+  btnDismiss.addEventListener('click', function(){
+    try { localStorage.setItem('tp_text_snap_dismissed_ts', String(ts)); } catch(e) {}
+    removeSnapshotBanner();
+  });
+  banner.appendChild(msg);
+  banner.appendChild(btnRecover);
+  banner.appendChild(btnDismiss);
+  document.body.appendChild(banner);
+}
+
+/* ── 2 & 3. Visibility + pagehide flush ──
+   The prose save is debounced 250ms; if the user closes the tab inside
+   that window the last burst of edits is lost. Flush on visibilitychange
+   (mobile background) and pagehide (definitive close path). */
+function flushPendingSave(){
+  if (_proseSaveTimer) {
+    clearTimeout(_proseSaveTimer);
+    _proseSaveTimer = null;
+    save();
+  }
+  /* Also flush the snapshot opportunistically — without this, a user who
+     pastes a long script and immediately closes the tab (or backgrounds
+     the app on mobile) inside the first 5-minute window would have no
+     snapshot to recover from if `tp_text` later got corrupted. The
+     50-char threshold and dedupe inside writeSnapshot still apply, so
+     this is a no-op when there's nothing useful to write. */
+  writeSnapshot();
+}
+document.addEventListener('visibilitychange', function(){
+  if (document.visibilityState === 'hidden') flushPendingSave();
+});
+window.addEventListener('pagehide', flushPendingSave);
+
+/* ── 4. beforeunload prompt ──
+   Belt-and-braces with the flush above: pagehide will save anyway, but the
+   browser's native "leave site?" prompt gives the user a chance to abort
+   the close if they typed something they care about in the last 250ms. */
+window.addEventListener('beforeunload', function(e){
+  if (_proseSaveTimer) {
+    e.preventDefault();
+    e.returnValue = ''; /* required by some browsers */
+    return '';
+  }
+});
+
+/* ── 5. Download script ──
+   Build a Blob from the current prose and trigger a download. Filename
+   includes the date so multiple backups don't collide. Fully offline —
+   no network, no third-party APIs. */
+document.getElementById('btn-download-script').addEventListener('click', function(){
+  var btn = this;
+  var url = null;
+  var a = null;
+  try {
+    var text = document.getElementById('prose').innerText || '';
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    url  = URL.createObjectURL(blob);
+    a = document.createElement('a');
+    var d = new Date();
+    var stamp = d.getFullYear() + '-' +
+                ('0'+(d.getMonth()+1)).slice(-2) + '-' +
+                ('0'+d.getDate()).slice(-2);
+    a.href = url;
+    a.download = 'ultrascript-' + stamp + '.txt';
+    document.body.appendChild(a);
+    a.click();
+    btn.textContent = 'Downloaded!';
+    setTimeout(function(){ btn.textContent = 'Download script'; }, 1800);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    setTimeout(function(){ btn.textContent = 'Download script'; }, 1800);
+  } finally {
+    /* Clean up DOM and revoke the object URL even if click() throws — a
+     * sandboxed environment can reject the synthetic click and leak the
+     * <a> element + the blob URL otherwise. */
+    if (a && a.parentNode) a.parentNode.removeChild(a);
+    if (url) setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+});
+
+/* ── 6. Load from file ──
+   Hidden file input triggered by the visible button. The OS file picker
+   already acts as confirmation — the user must navigate to a file and
+   click Open, so a separate two-step confirm is redundant. */
+document.getElementById('btn-import-script').addEventListener('click', function(){
+  /* Stop playback or an in-flight countdown before opening the picker so
+     the file load starts from a coherent scroll/layout state. */
+  pauseOrCancel();
+  document.getElementById('script-file-input').click();
+});
+document.getElementById('script-file-input').addEventListener('change', function(){
+  var btn = document.getElementById('btn-import-script');
+  if (!this.files || !this.files[0]) return;
+  var file = this.files[0];
+  /* Reset the input so re-selecting the same file fires `change` again. */
+  this.value = '';
+  var reader = new FileReader();
+  reader.onload = function(e){
+    try {
+      var text = (e.target && typeof e.target.result === 'string') ? e.target.result : '';
+      /* v1.1 — accept .txt, .md, and .json. .txt and .md are loaded as
+         plain text (Markdown formatting is preserved verbatim, since the
+         prompter doesn't render Markdown — the syntax shows up in the
+         read, which is what users who export from Notion / Bear / etc.
+         expect). .json is treated as a wrapper:
+           - object with `script` or `text` key  → use that value
+           - array of strings                   → join with double newlines
+           - anything else                      → JSON.stringify pretty-printed
+         The format is detected from the filename (case-insensitive); no
+         attempt is made to sniff content because that would mis-classify
+         hand-typed strings that happen to start with `{`. */
+      var name = (file.name || '').toLowerCase();
+      if (/\.json$/.test(name)) {
+        try {
+          var parsed = JSON.parse(text);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            if (typeof parsed.script === 'string') {
+              text = parsed.script;
+            } else if (typeof parsed.text === 'string') {
+              text = parsed.text;
+            } else {
+              text = JSON.stringify(parsed, null, 2);
+            }
+          } else if (Array.isArray(parsed)) {
+            /* Filter to strings only — a stray non-string element would
+               otherwise serialise as "[object Object]" in the join output. */
+            text = parsed.filter(function(x){ return typeof x === 'string'; }).join('\n\n');
+          } else {
+            text = JSON.stringify(parsed, null, 2);
+          }
+        } catch (jsonErr) {
+          /* Malformed JSON — fall through and load the raw file content as
+             plain text. Better than failing outright; the user can fix the
+             file and reload. */
+        }
+      }
+      var prose = document.getElementById('prose');
+      /* Mirror the paste flow: write a single text node with literal \n
+         characters preserved, then normalize to <div> blocks. Using
+         `prose.innerText = text` instead would make the visual look right
+         (browser inserts <br>) but `textContent` would no longer reproduce
+         the newlines — and parseDialogue's flat-text fallback uses
+         textContent, so a multi-speaker import would collapse to a single
+         block and every speaker after the first would be silently lost. */
+      prose.innerHTML = '';
+      prose.appendChild(document.createTextNode(text));
+      normalizeProse();
+      invalidateLayout();
+      /* Reset scroll to the top so the imported script starts at the
+         reading anchor on first paint. Blur #prose and clear any
+         document selection so the contenteditable caret is completely
+         removed — after a DOM rebuild the caret lands at position-0
+         and renders above the reading line if the user had previously
+         scrolled down. removeAllRanges() is required in addition to
+         blur() because Chrome preserves an "inactive" caret in the
+         element even after it loses focus. */
+      offset = 0;
+      document.getElementById('scroll').scrollTop = 0;
+      document.getElementById('prose').blur();
+      if (window.getSelection) { window.getSelection().removeAllRanges(); }
+      save();
+      if (multiOn) {
+        splitMidBlockLabels();
+        parseDialogue(); renderDialogue(); renderSpeakerList();
+      }
+      btn.textContent = 'Loaded!';
+      setTimeout(function(){ btn.textContent = 'Load from file…'; }, 1800);
+    } catch(err) {
+      btn.textContent = 'Failed';
+      setTimeout(function(){ btn.textContent = 'Load from file…'; }, 1800);
+    }
+  };
+  reader.onerror = function(){
+    showErrorToast('Could not read file.');
+    btn.textContent = 'Failed';
+    setTimeout(function(){ btn.textContent = 'Load from file…'; }, 1800);
+  };
+  reader.readAsText(file);
+});
+
+raf = requestAnimationFrame(loop);
+</script>
+</body>
+</html>
